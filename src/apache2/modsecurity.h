@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -38,12 +38,15 @@ typedef struct msc_parm msc_parm;
 #include "msc_multipart.h"
 #include "msc_pcre.h"
 #include "msc_util.h"
+#include "msc_json.h"
 #include "msc_xml.h"
+#include "msc_tree.h"
 #include "msc_geo.h"
 #include "msc_gsb.h"
 #include "msc_unicode.h"
 #include "re.h"
 #include "msc_crypt.h"
+#include "msc_remote_rules.h"
 
 #include "ap_config.h"
 #include "apr_md5.h"
@@ -57,7 +60,6 @@ typedef struct msc_parm msc_parm;
 #if defined(WITH_LUA)
 #include "msc_lua.h"
 #endif
-
 
 #define PHASE_REQUEST_HEADERS       1
 #define PHASE_REQUEST_BODY          2
@@ -132,6 +134,7 @@ typedef struct msc_parm msc_parm;
 #define FATAL_ERROR "ModSecurity: Fatal error (memory allocation or unexpected internal error)!"
 
 extern DSOLOCAL char *new_server_signature;
+extern DSOLOCAL char *real_server_signature;
 extern DSOLOCAL char *chroot_dir;
 
 extern module AP_MODULE_DECLARE_DATA security2_module;
@@ -142,9 +145,23 @@ extern DSOLOCAL unsigned long int msc_pcre_match_limit;
 
 extern DSOLOCAL unsigned long int msc_pcre_match_limit_recursion;
 
+#ifdef WITH_REMOTE_RULES
+extern DSOLOCAL msc_remote_rules_server *remote_rules_server;
+#endif
+extern DSOLOCAL int remote_rules_fail_action;
+extern DSOLOCAL char *remote_rules_fail_message;
+
+extern DSOLOCAL int status_engine_state;
+
+extern DSOLOCAL int conn_limits_filter_state;
+
 extern DSOLOCAL unsigned long int conn_read_state_limit;
+extern DSOLOCAL TreeRoot *conn_read_state_whitelist;
+extern DSOLOCAL TreeRoot *conn_read_state_suspicious_list;
 
 extern DSOLOCAL unsigned long int conn_write_state_limit;
+extern DSOLOCAL TreeRoot *conn_write_state_whitelist;
+extern DSOLOCAL TreeRoot *conn_write_state_suspicious_list;
 
 extern DSOLOCAL unsigned long int unicode_codepage;
 
@@ -181,6 +198,12 @@ extern DSOLOCAL int *unicode_map_table;
 #define MODSEC_DISABLED                 0
 #define MODSEC_DETECTION_ONLY           1
 #define MODSEC_ENABLED                  2
+
+#define STATUS_ENGINE_ENABLED           1
+#define STATUS_ENGINE_DISABLED          0
+
+#define REMOTE_RULES_ABORT_ON_FAIL	0
+#define REMOTE_RULES_WARN_ON_FAIL	1
 
 #define HASH_DISABLED             0
 #define HASH_ENABLED              1
@@ -245,6 +268,7 @@ struct modsec_rec {
     unsigned int         phase_request_body_complete;
 
     apr_bucket_brigade  *if_brigade;
+    unsigned int         if_seen_eos;
     unsigned int         if_status;
     unsigned int         if_started_forwarding;
 
@@ -355,11 +379,17 @@ struct modsec_rec {
 
     apr_size_t           msc_reqbody_no_files_length;
 
+    char		*msc_full_request_buffer;
+    int			msc_full_request_length;
+
     char                *multipart_filename;
     char                *multipart_name;
     multipart_data      *mpd;                        /* MULTIPART processor data structure */
 
     xml_data            *xml;                        /* XML processor data structure       */
+#ifdef WITH_YAJL
+    json_data           *json;                       /* JSON processor data structure      */
+#endif
 
     /* audit logging */
     char                *new_auditlog_boundary;
@@ -442,6 +472,8 @@ struct modsec_rec {
     lua_State           *L;
     #endif
 #endif
+
+    int                 msc_sdbm_delete_error;
 };
 
 struct directory_config {
@@ -486,6 +518,11 @@ struct directory_config {
 
     /* AUDITLOG_SERIAL (single file) or AUDITLOG_CONCURRENT (multiple files) */
     int                  auditlog_type;
+
+#ifdef WITH_YAJL
+    /* AUDITLOGFORMAT_NATIVE or AUDITLOGFORMAT_JSON */
+    int                  auditlog_format;
+#endif
 
     /* Mode for audit log directories and files */
     apr_fileperms_t      auditlog_dirperms;
@@ -579,7 +616,7 @@ struct directory_config {
 
     /* Hash */
     apr_array_header_t  *hash_method;
-    const char *crypto_key;
+    const char          *crypto_key;
     int                 crypto_key_len;
     const char          *crypto_param_name;
     int                 hash_is_enabled;
@@ -598,6 +635,14 @@ struct directory_config {
 
     /* xml */
     int                 xml_external_entity;
+
+    /* This will be used whenever ModSecurity will be ready
+     * to ask the server for newer rules.
+     */
+#if 0
+    msc_remote_rules_server *remote_rules;
+    int remote_timeout;
+#endif
 };
 
 struct error_message_t {
@@ -612,6 +657,9 @@ struct msc_engine {
     apr_pool_t              *mp;
     apr_global_mutex_t      *auditlog_lock;
     apr_global_mutex_t      *geo_lock;
+#ifdef GLOBAL_COLLECTION_LOCK
+    apr_global_mutex_t      *dbm_lock;
+#endif
     msre_engine             *msre;
     unsigned int             processing_mode;
 };

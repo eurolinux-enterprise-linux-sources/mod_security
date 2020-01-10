@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -227,7 +227,7 @@ static int multipart_parse_content_disposition(modsec_rec *msr, char *c_d_value)
                 p--;
                 if(*p == '\'' || *p == '\"') {
                     if (msr->txcfg->debuglog_level >= 9) {
-                        msr_log(msr, 9, "Multipart: Invalid quoting detected: %s length %d bytes",
+                        msr_log(msr, 9, "Multipart: Invalid quoting detected: %s length %zu bytes",
                                 log_escape_nq(msr->mp, p), strlen(p));
                     }
                     msr->mpd->flag_invalid_quoting = 1;
@@ -1329,6 +1329,11 @@ apr_status_t multipart_cleanup(modsec_rec *msr) {
                 if (parts[i]->tmp_file_name != NULL) {
                     const char *new_filename = NULL;
                     const char *new_basename = NULL;
+
+                    if (strcmp(msr->txcfg->upload_dir, msr->txcfg->tmp_dir) == 0) {
+                        msr_log(msr, 4, "Not moving part to identical location");
+                        continue;
+                    }
 
                     /* make sure it is closed first */
                     if (parts[i]->tmp_file_fd > 0) {

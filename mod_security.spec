@@ -5,20 +5,18 @@
 %{!?_httpd_confdir:    %{expand: %%global _httpd_confdir    %%{_sysconfdir}/httpd/conf.d}}
 %{!?_httpd_moddir:    %{expand: %%global _httpd_moddir    %%{_libdir}/httpd/modules}}
 
-%global with_mlogc 0%{?fedora} || 0%{?rhel} <= 6
+%global with_mlogc 1
 
 Summary: Security module for the Apache HTTP Server
 Name: mod_security 
-Version: 2.7.3
-Release: 5%{?dist}
+Version: 2.9.2
+Release: 1%{?dist}
 License: ASL 2.0
 URL: http://www.modsecurity.org/
 Group: System Environment/Daemons
-Source: http://www.modsecurity.org/tarball/%{version}/modsecurity-apache_%{version}.tar.gz
+Source: https://www.modsecurity.org/tarball/%{version}/modsecurity-%{version}.tar.gz
 Source1: mod_security.conf
 Source2: 10-mod_security.conf
-Patch0: mod_security-2.7.3-fix-mem-leak-and-cve-2013-2765.patch
-Patch1: modsecurity-2.7.3-CVE-2013-5705.patch
 
 Requires: httpd httpd-mmn = %{_httpd_mmn}
 BuildRequires: httpd-devel libxml2-devel pcre-devel curl-devel lua-devel
@@ -29,24 +27,28 @@ for web applications. It operates embedded into the web server, acting
 as a powerful umbrella - shielding web applications from attacks.
 
 %if %with_mlogc
-%package -n     mlogc
+%package	mlogc
 Summary:        ModSecurity Audit Log Collector
 Group:          System Environment/Daemons
 Requires:       mod_security
 
-%description -n mlogc
+%description	mlogc
 This package contains the ModSecurity Audit Log Collector.
 %endif
 
 %prep
-%setup -q -n modsecurity-apache_%{version}
-%patch0 -p1
-%patch1 -p1
+%setup -q -n modsecurity-%{version}
 
 %build
 %configure --enable-pcre-match-limit=1000000 \
            --enable-pcre-match-limit-recursion=1000000 \
-           --with-apxs=%{_httpd_apxs}
+           --with-apxs=%{_httpd_apxs} \
+%if %with_mlogc
+	   --enable-mlogc \
+%else
+	   --disable-mlogc \
+%endif
+	   --enable-collection-global-lock
 # remove rpath
 sed -i 's|^hardcode_libdir_flag_spec=.*|hardcode_libdir_flag_spec=""|g' libtool
 sed -i 's|^runpath_var=LD_RUN_PATH|runpath_var=DIE_RPATH_DIE|g' libtool
@@ -101,7 +103,7 @@ rm -rf %{buildroot}
 %attr(770,apache,root) %dir %{_localstatedir}/lib/%{name}
 
 %if %with_mlogc
-%files -n mlogc
+%files mlogc
 %defattr (-,root,root)
 %doc mlogc/INSTALL
 %attr(0640,root,apache) %config(noreplace) %{_sysconfdir}/mlogc.conf
@@ -112,6 +114,17 @@ rm -rf %{buildroot}
 %endif
 
 %changelog
+* Wed Sep  6 2017 Daniel Kopecek <dkopecek@redhat.com> - 2.9.2-1
+- RHEL-7.5 erratum
+ - Update to 2.9.2
+ - Fixed bogus dates in the spec file
+ - Enabled mlogc subpackage
+ - Enabled collection global lock to prevent collection
+   removal failures
+  Resolves: rhbz#1388656
+  Resolves: rhbz#1139728
+  Resolves: rhbz#1473420
+
 * Thu Apr  3 2014 Daniel Kopecek <dkopecek@redhat.com> - 2.7.3-5
 - Fix Chunked string case sensitive issue (CVE-2013-5705)
   Resolves: rhbz#1082907
@@ -196,7 +209,7 @@ rm -rf %{buildroot}
 * Fri Jan 13 2012 Fedora Release Engineering <rel-eng@lists.fedoraproject.org> - 2.5.13-2
 - Rebuilt for https://fedoraproject.org/wiki/Fedora_17_Mass_Rebuild
 
-* Wed May 3 2011 Michael Fleming <mfleming+rpm@thatfleminggent.com> - 2.5.13-1
+* Tue May 3 2011 Michael Fleming <mfleming+rpm@thatfleminggent.com> - 2.5.13-1
 - Newer upstream version
 
 * Wed Jun 30 2010 Michael Fleming <mfleming+rpm@thatfleminggent.com> - 2.5.12-3
@@ -244,10 +257,9 @@ rm -rf %{buildroot}
 * Tue Feb 19 2008 Fedora Release Engineering <rel-eng@fedoraproject.org> - 2.1.5-3
 - Autorebuild for GCC 4.3
 
-* Sat Jan 27 2008 Michael Fleming <mfleming+rpm@enlartenment.com> 2.1.5-2
+* Sun Jan 27 2008 Michael Fleming <mfleming+rpm@enlartenment.com> 2.1.5-2
 - Update to 2.1.5 (bz#425986)
 - "blocking" -> "optional_rules" per tarball ;-)
-
 
 * Thu Sep  13 2007 Michael Fleming <mfleming+rpm@enlartenment.com> 2.1.3-1
 - Update to 2.1.3

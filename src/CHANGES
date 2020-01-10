@@ -1,3 +1,570 @@
+18 Jul 2017 - 2.9.2
+-------------------
+
+ * IIS build refactoring and dependencies update
+   [Issue #1487 - @victorhora]
+ * Best practice: Initialize msre_var pointers
+   [Commit fbd57 - Allan Boll]
+ * nginx: Obtain port from r->connection->local_sockaddr.
+   [Commit 51314 - @defanator]
+ * Updates libinjection to v3.10.0
+   [Issue #1412 - @client9, @zimmerle and @bjdijk]
+ * Avoid log flood while using SecConnEngine
+   [Issue #1436 - @victorhora]
+ * Make url path absolute for SecHashEngine only when it is relative
+   in the first place.
+   [Issue #752, #1071 - @hideaki]
+ * Fix the hex digit size for SHA1 on msc_crypt implementation.
+   [Issue #1354 - @zimmerle and @parthasarathi204]
+ * Avoid to flush xml buffer while assembling the injected html.
+   [Issue #742 - @zimmerle]
+ * Avoid additional operator invokation if last transform of a multimatch
+   doesn't modify the input
+   [Issue #1086, #1087 - Daniel Stelter-Gliese]
+ * Adds a sanity check before use ctl:ruleRemoveTargetByTag.
+   [Issue #1353 - @LukeP21 and @zimmerle]
+ * Uses an optional global lock while manipulating collections.
+   [Issues #1224 - @mturk and @zimmerle]
+ * Fix collection naming problem while merging collections.
+   [Issue #1274 - Coty Sutherland and @zimmerle]
+ * Fix --enable-docs adding missing Makefile, modifying autoconf and filenames
+   [Issue #1322 - @victorhora]
+ * Change from using rand() to thread-safe ap_random_pick.
+   [Issue #1289 - Robert Bost]
+ * Cosmetics: added comments on odd looking code to prevent future
+   scrutiny
+   [Issue #1279 - Coty Sutherland]
+ * {dis|en}able-server-context-logging: Option to disable logging of
+   server info (log producer, sanitized objects, ...) in audit log.
+   [Issue #1069 - Marc Stern]
+ * Allow drop to work with mod_http2
+   [Issue #1308, #992 - @bazzadp]
+ * Fix SecConn(Read|Write)StateLimit on Apache 2.4
+   [Issue #1340, #1337, #786 - Sander Hoentjen]
+ * {dis|en}able-stopwatch-logging: Option to disable logging of stopwatches
+   in audit log.
+   [Issue #1067 - Marc Stern]
+ * {dis|en}able-dechunk-logging: Option to disable logging of
+   dechunking in audit log when log level < 9.
+   [Issue #1068 - Marc Stern]
+ * Updates libinjection to: da027ab52f9cf14401dd92e34e6683d183bdb3b4
+   [ModSecurity team]
+ * {dis|en}able-handler-logging: Option to disable logging of Apache handler
+   in audit log
+   [Issue #1070, #1381 - Marc Stern]
+ * {dis|en}able-collection-delete-problem-logging: Option to disable logging of
+   collection delete problem in audit log when log level < 9.
+   [Issue #1380 - Marc Stern]
+ * Adds rule id in logs whenever a rule fail.
+   [Issue #1379, #391 - Marc Stern]
+ * {dis|en}able-server-logging: Option to disable logging of
+   "Server" in audit log when log level < 9.
+   [Issue #1070 - Marc Stern]
+ * {dis|en}able-filename-logging: Option to disable logging of filename
+   in audit log.
+   [Issue #1065 - Marc Stern]
+ * Reads fuzzy hash databases on init
+   [Issue #1339 - Robert Paprocki and @Rendername]
+ * Changes the configuration to recognize soap+xml as XML
+   [Issue #1374 - @emphazer and Chaim Sanders]
+ * Fix building with nginx >= 1.11.11
+   [Issue #1373, #1359 - Andrei Belov and Thomas Deutschmann]
+ * Using Czechia instea of Czech Republic
+   [Issue #1258 - Michael Kjeldsen]
+ * {dis|en}able-rule-id-validation: Option to disable rule id validation
+   [Issue #1150 - Marc Stern and ModSecurity team]
+ * JSON Log: Append a newline to concurrent JSON audit logs
+   [Issue #1233 - Robert Paprocki]
+ * JSON Log: Don't unnecessarily rename request body parts in cleanup
+   [Issue #1223 - Robert Paprocki]
+ * Fix error message inside audit logs
+   [Issue #1216 and #1073 - Armin Abfalterer]
+ * Remove port from IPV4 address when running under IIS.
+   [Issue #1220, #1109 and #734  - Robert Culyer]
+ * Remove logdata and msg fields from JSON audit log rule.
+   [Issue #1190 and #1174 - Robert Paprocki]
+ * Better handle the json parser cleanup
+   [Issue #1204 - Ephraim Vider]
+ * Fix status failing to report in Nginx auditlogs
+   [Issue #977, #1171 - @charlymps and Chaim Sanders]
+ * Fix file upload JSON audit log entry
+   [Issue #1181 and #1173 - Robert Paprocki and Christian Folini]
+ * configure: Fix detection whether libcurl is linked against gnutls and,
+   move verbose_output declaration up to the beginning.
+   [Issue #1158 - Thomas Deutschmann (@Whissi)]
+ * Treat APR_INCOMPLETE as APR_EOF while receiving the request body.
+   [Issue #1060, #334 - Alexey Sintsov]
+
+
+Security issues
+
+ * Allan Boll reported an uninitialized variable that may lead to a crash on
+   Windows platform.
+ * Brian Adeloye reported an infinite loop on the version of libinjection used
+   on ModSecurity 2.9.1.
+
+
+09 Mar 2016 - 2.9.1
+-------------------
+
+ * No changes.
+
+03 Feb 2016 - 2.9.1-RC1
+-----------------------
+
+ * Added support to generate audit logs in JSON format.
+   [Issue #914, #897, #656 - Robert Paprocki]
+ * Creating AuditLog serial file (or parallel index) respecting the
+   permission configured with SecAuditLogFileMode. Previously, it was
+   used only to save the transactions while in parallel mode.
+   [Issue #852 - @littlecho and ModSecurity team]
+ * Checking for hashing injection response, to report in case of failure.
+   [Issue #1041 - ModSecurity team]
+ * Stop buffering when the request is larger than SecRequestBodyLimit
+   in ProcessPartial mode
+   [Issue #709, #705, #728 - Justin Gerace and ModSecurity team]
+ * Extended Lua support to include version 5.3
+   [Issue #837, #762, #814 - Athmane Madjoudj and ModSecurity team]
+ * mlogc: Allows user to choose between TLS versions (TLSProtocol option
+   introduced).
+   [Issue #881 - Ishwor Gurung]
+ * Allows mod_proxy's "nocanon" behavior to be specified in proxy actions
+   [Issue #1031, #961, #763 - Mario D. Santana and ModSecurity team]
+ * Refactoring conditional #if/#defs directives.
+   [Issue #996 - Wesley M and ModSecurity team]
+ * mlogc-batch-load.pl.in: fix searching SecAuditLogStorageDir
+   files with Apache 2.4
+   [Issue #775 - Elia Pinto]
+ * Understands IIS 10 as compatible on Windows installer.
+   [Issue #931 - Anton Serbulov, Pavel Vasilevich and ModSecurity team]
+ * Fix apache logging limitation by using correct Apache call.
+   [Issue #840 - Christian Folini]
+ * Fix apr_crypto.h check on 32-bit Linux platform
+   [Issue #882, #883 - Kurt Newman]
+ * Fix variable resolution duration (Content of the DURATION variable).
+   [Issue #662 - Andrew Elble]
+ * Fix crash while adding empty keys to persistent collections.
+   [Issue #927 - Eugene Alekseev, Marc Stern and ModSecurity team]
+ * Remove misguided call to srand()
+   [Issues #778, #781 and #836 - Michael Bunk, @gilperon]
+ * Fix compilation problem while ssdeep is installed in non-standard
+   location.
+   [Issue #872 - Kurt Newman]
+ * Fix invalid storage reference by apr_psprintf at msc_crypt.c
+   [Issue #609 - Jeff Trawick]
+
+12 Feb 2015 - 2.9.0
+-------------------
+
+ * Fix apr_crypto.h include, now checking if apr_crypto.h is available by
+   checking the definition WITH_APU_CRYPTO.
+   [martinjina and ModSecurity team]
+
+15 Dez 2014 - 2.9.0-RC2
+-----------------------
+
+ * OpenSSL dependency was removed on MS Windows builds. ModSecurity is now using
+   the Windows certificate storage.
+   [Gregg Smith, Steffen and ModSecurity team]
+ * Informs about external resources loaded/failed while reloading Apache.
+   [ModSecurity team]
+ * Adds missing 'ModSecurity:' prefix in some warnings messages.
+   [Walter Hop and ModSecurity team]
+ * Refactoring external resources download warn messages. Holding the message
+   to be displayed when Apache is ready to write on the error_log.
+   [ModSecurity team]
+ * Remote resources loading process is now failing in case of HTTP error.
+   [Walter Hop and ModSecurity team]
+ * Fixed start up crash on Apache with mod_ssl configured. Crash was happening
+   during the download of remote resources.
+   [Christian Folini, Walter Hop and ModSecurity team]
+ * Curl is not a mandatory dependency to ModSecurity core anymore.
+   [Rainer Jung and ModSecurity team]
+
+18 Nov 2014 - 2.9.0-RC1
+-----------------------
+
+ * `pmFromFile' and `ipMatchFromFile' operators are now accepting HTTPS served
+    files as parameter.
+ * `SecRemoteRules' directive - allows you to specify a HTTPS served file that
+    may contain rules in the SecRule format to be loaded into your ModSecurity
+    instance.
+ * `SecRemoteRulesFailAction' directive - allows you to control whenever the
+    user wants to Abort or just Warn when there is a problem while downloading
+    rules specified with the directive: `SecRemoteRules'.
+ * `fuzzyHash' operator - allows to match contents using fuzzy hashes.
+ * `FILES_TMP_CONTENT' collection - make available the content of uploaded
+    files.
+ * InsecureNoCheckCert - option to validate or not a chain of SSL certificates
+   on mlogc connections.
+ * ModSecurityIIS: ModSecurity event ID was changed from 0 to 0x1.
+   [Issue #676 - Kris Kater and ModSecurity team]
+ * Fixed signature on "status call": ModSecurity is now using the original
+   server signature.
+   [Issues #702 - Linas and ModSecurity team]
+ * YAJL version is printed while ModSecurity initialization.
+   [Issue #703 - Steffen (Apache Lounge) and Mauro Faccenda]
+ * Fixed subnet representation using slash notation on the @ipMatch operator.
+   [Issue #706 - Walter Hop and ModSecurity team]
+ * Limited the length of a status call.
+   [Issue #714 - 'cpanelkurt' and ModSecurity team]
+ * Added the missing -P option to nginx regression tests.
+   [Issue #720 - Paul Yang]
+ * Fixed automake scripts to do not use features which will be deprecated in
+   the upcoming releases of automake.
+   [Issue #760 - ModSecurity team]
+ * apr-utils's LDFALGS is now considered while building ModSecurity.
+   [Issue #782 - Daniel J. Luke]
+ * IIS installer is not considering IIS 6 as compatible anymore.
+   [Issue #790 - ModSecurity team]
+ * Fixed yajl build script: now looking for the correct header file.
+   [Issue #804 - 'rpfilomeno' and ModSecurity team]
+ * mlgoc is now forced to use TLS 1.x.
+   [Issue #806 - Josh Amishav-Zlatin and ModSecurity team]
+
+
+14 Apr 2014 - 2.8.0
+-------------------
+
+Bug fix
+ * Build issue: Now using autotools to idenfiy if sys/utsname.h is present.
+ * Change configure.ac version to 2.8
+
+31 Mar 2014 - 2.8.0-RC1
+-----------------------
+
+New features
+ * JSON Parser is no longer under tests. Now it is part of our mainline;
+ * Connection limits (SecConnReadStateLimit/SecConnWriteStateLimit) now support white and suspicious list;
+ * New variables: FULL_REQUEST and FULL_REQUEST_LENGTH were added, allowing the rules to access the full content of a request;
+ * ModSecurity status is now part of our mainline;
+ * New operator: @detectXSS was added. It makes usage of the newest libinjection XSS detection functionality;
+ * Append and prepend are now supported on nginx (Ref: #635);
+ * SecServerSignature is now available on nginx (Ref: #637).
+
+Improvements 
+ * Regression tests are not able to expect different values according to the platform;
+ * Visual C++ 12/10 runtime dependencies are now part of the IIS installer, no need to have it installed prior ModSecurity installation (Ref: #627);
+ * New script was added to the IIS versions to identify whenever there is a missing dependency (available through the Application Menu);
+ * Memory usage improvement: using correct memory pools according to the context (Ref: #618, #620, #619);
+ * Independent API call to free the connection allocations, independently from the request objects, improvements on Nginx performance, vide issue for more information (Ref: #620, #648);
+ * IIS installer is now using the correct 32/64bits folders to install;
+ * IIS Installer 32bits now refuses to install on 64bits environments;
+ * IIS: Using new WiX options to build the package in the correct architecture;
+ * While installing IIS version the installer will remove old ModSecurityIIS configuration or files before proceed with the installation, avoiding further errors;
+ * CRS from IIS version was upgraded to 2.2.9;
+ * IIS installer does not support repair anymore, in fact it was not working already and it is now disabled;
+ * ModSecurity now warns the user who tries to use "proxy" in IIS or Nginx. Proxy is Apache only;
+ * Remove warnings from the build process (Ref: #617);
+ * Apache configuration in regression tests was changed making it more platform independent;
+ * Reduced the amount of warnings during the compilation (Ref: #385a2828e87897bd611bd2a519727ef88dc6d632, #1e63e49db4a592d28e08a33fc60750c37a3886fe);
+ * Regression tests were refactored to be more Nginx friendly;
+ * Fixed some regression tests that were not being flexible to handle multiple platforms: (Ref #636)
+        - Fixed config/00-load-modsec.t test case. Now it expects for Nginx loaded message as it does for Apache. (Ref: #643);
+        - Fixed mixed/10-misc-directives.t. Now it does not expect for SecServerSignature on the logs, just in the headers as the Nginx does in silence.
+        - Fixed tnf/10-tfn-cache.t, action/10-logging.t, config/10-misc-directives.t, config/10-request-directives.t, misc/00-multipart-parser.t , misc/10-tfn-cache.t, rule/20-exceptions.t, rule/00-basics.t, rule/10-xml.t;
+        - Increased the timeout while reading the auditlog;
+        - SecAuditLogType Concurrent was removed from the regression test case, not compatible with all ports yet;
+        - Regression tests were speeded up, as the number of tests are growing it is impossible to have it slow;
+        - Fixed regression tests scripts paths, to make it MacOS friendly;
+        - Avoiding dead locks on Nginx regression tests by enforcing a timeout whenever a request appears to fail; 
+ * Updates to fix errors found by Parfait static code analysis (Ref: #612);
+ * Cleaning up on the repository, by removing unused files;
+ * IIS installer now supports to perform the installation without register the DLL on the system. It means that the user can download our MSI installer as it was a tarball archive (Ref #629, #624);
+ * IIS now support 32bits and 64bits pools, both are registered on IIS (Ref #628).
+
+Bug fix
+ * Correctly handling inet_pton in IIS version;
+ * Nginx was missing a terminator while the charset string was mounted (Ref: #148);
+ * Added mod_extract_forwarded.c to run before mod_security2.c (Ref: #594);
+ * Added missing environment variables to regression tests;
+ * Build system is now more flexible by looking at liblua at: /usr/local/lib;
+ * Fixed typo in README file.
+ * Removed the non standard compliant HTTP response status code 44 from modsecurity recommended file (Ref: #665);
+ * Fixed segmentation fault if it fails to write on the audit log (Ref: #668);
+ * Not rejecting a larger request with ProcessPartial. Regression tests were also added (Ref: #597);
+ * Fixed UF8 to unicode conversion. Regression tests were also added(Ref: #672);
+ * Avoiding segmentation fault by checking if a structure is null before access its members;
+ * Removed double charset-header that used happen due a hardcoded charset in Nginx implementation (Ref: #650);
+ * Now alerting the users that there is no memory to proceed loading the configuration instead of just die;
+ * If SecRuleEngine is set to Off and SecRequestBodyAccess On Nginx returns error 500. Standalone is now capable to identify whenever ModSecurity is enabled or disabled, independently of ModSecurity core (Ref: #645); 
+ * Fixed missing headers on Nginx whenever SecResponseBodyAccess was set to On and happens to be a filter on phase equals or over 3. (Ref #634);
+ * IIS is now picking the correct version of AppCmd while uninstalling or installing ModSecurityISS. (Ref #632).
+
+
+
+17 Dec 2013 - 2.7.7
+-------------------
+Fixes:
+
+- Changed release version to 2.7.7
+- Got the configure scripts inside the release tarball
+
+
+16 Dec 2013 - 2.7.6 
+-------------------
+Improvements:
+
+- Organizes all Makefile.am - 1cde4d2dd9d96747536c1c25d06ba0677069477f
+  Now using one file per line (sorted). This is the better way to handle it, since it reduces the possibility of merge conflicts.
+
+- nginx: generates config file using configure input. - 351b9cc357d439e30ebd61d89a9e38ecf55c6827
+  The nginx config file was looking for depedencies by its own, by doing that it was ignoring the options that were passed to configure script. This commit deletes this config file and adds a meta-config which is populated by configure whenever the standalone-module is enabled.
+
+- nginx: adds lua support - da16d9e5d51d4ef8734687514a4e1368e7fb4284
+
+- iis: Cosmetics fixies on sqli. - 5046c8327ea21c69b4c0d0c0057c692b05b09fef
+  This is needed to get it compiled with VS2011 on Windows8
+
+- Regression tests: makes configuration compatible with 2.2 and 2.4 (try 2) - ae252ee8767069363906e5a611dff487b799b839
+
+- nginx: Trying apxs and apxs2 while compiling nginx module - 65d9272fdc353e1263567b60604542d377d19672
+
+- nginx: Trying apxs and apxs2 while compiling nginx module - 35fd75d859e4a8873b8843da1db13e04a1b08140
+
+- macos: Using glibtoolize instead of libtoolize - 751a9f4e45213cd69f00c62c71edc9d7ad99b82d
+
+- regression-tests: makes configuration compatible with 2.2 and 2.4 - 6fc4cac37ab1be8d1232140042b58fe4bd93ee17
+
+- Regression test: get it working with apache 2.4 - e9813cd0d9bfc5b0c9aa5832634ec1b39b805108
+  Changes in httpd.conf.in to get it working with apache 2.4
+
+- Code cosmetics. - 7366f35c1d80772d739b35da8faa972f92a72b97
+  Changed to reduce the number of possible fails during Build Bot compilation.
+
+- iis: Waiting for 5 seconds before move curl directory - 9bf2959c919587ebc63f5a1b8c0785da8927bff5
+  Testing buildbot.
+
+- Redefines unixd_set_global_mutex_perms on tests - f70f6f4281b806627e0cf0dbb9c84ae5864bdb16
+  Avoding conflicts with the standalone implementation
+
+- Adds verbose quality check - 388943440cc9b8c6fdea09f5e365a2e5a3e792e2
+  Vera++ and ccpcheck are not outputing to the stderr instead stdout allowing the buildbot to extract some numbers about it.
+
+- Adds support for coding style and quality check - b77e90152d119609ac78a7028383c3b79898b2cf
+  Initial effort to get the code on shape. This will be executed by the buildbots as soon as they get ready for it.
+
+- iis: New improvements on the Wix installer - 2ea5a74a7bfb00f21312e51e48aa6dac03d84600
+  * Now the installation is divided in modules: ModSecurity and CRS.
+  * Added default configuration
+  * Configuration was moved to "Program Files" folder
+  * Build_msi script now using candle available in %PATH%
+
+- iis: Removes the installer helper dependency - 1a12648c9f6028f251af0f03c889397c7954b74c
+  Now using appcmd directly with WiX instead of calling the installer helper.
+
+- iis: Remove readme.html - 550d5aae21cba696cac1ce75ab8113e5255d5a59
+  This HTML is about "Creating a Native Module for IIS7" not straight related to ModSecurity itself.
+
+- iis: Adds batch script to compile Wix - a2c5fc831baf0b324ebb66b0f878dacf1ec2f808
+  This batch script can be used to generate our msi installer.
+
+- iis: Adds Wix installer resources - 3604763e15a665eb7a6ecae1f7e7c65cebbb1d17
+  This is all about cosmetic changes.
+
+- iss: Removes Post-Build event. - 28bbde1bb218b004654cb865fc8563d69b848dc2
+  There was a copy on Post-Build event using a hard coded path. This patch removes this Post-Build event.
+
+- iis: Relative paths on the VS project file - 368617ddb2443f9b6036f80a648d467d07c9a054
+  There are a ModSecurityIIS solution and project files, those were using hard coded paths to meet the dependencies. As consequence of the last update in our build scripts, now we are able to built the dependencies and load it to our Visual Studio project using relative paths.
+
+- iis: Adds release script - 9477118903861ce80c4c27cb581bf3462315e98e
+
+- iis: fixies the Installer.cpp coding style - 79875b1af8e8571098345b91557bab9c06eb7c88
+
+- iis: Removes AppWizard remade file - 91738f93bcc82b6ab756c550a66b6cf6af2fa9f8
+  Apparently the AppWizard was used to generate part of this Installer, the ReadMe.txt created by the AppWizard was removed by this commit
+
+- iss: Removes pre-compiled headers - adfbeb85dcfa9466b72eebb8d1bd8eb7728bab79
+  No need to use the pre-compiled headers in InstallerHelper, removing it, in order to keep the project lean.
+
+- iis: Moves installer to InstallerHelper - 6adf25667dd4bfa33010bd6d8ae3d35046a69967
+  To organize the folder the Installer application was renamed to installer helper. It is not the real installer, it is just an helper which is executed during the installation phase.
+
+- iss: Removes fart dependencies - 8c3b8d81b613aaa38f28472af1eb26c90c7fc9da
+  This commit removes the dependency of the fart.exe utility. The utility was responsible to rename contents inside some dependencies build files. Those modifications are not longer needed.
+
+- iss: Better err handling in build scripts. - 192599bf63b6ae5aa08e4536a90d5d0a17f969f7
+  Now checking for errors in every step of the build phase
+
+- iis: Moves build_module.bat to build_modsecurity.bat - e25c6b2e85ced7beba4d41867dbdf30e9c1286d3
+  The build_modsecurity.bat is now on the iis sub-directory, not in the dependencies anymore. Its content was also changed fixing all the paths.
+
+
+- iis: Identifies arch before unzip apache - cf5de78dfb9fffd21edf17af9e1db8f2fd83c804
+  Currently we need the Apache binary which could be used in 32 or 64 bits. This patch makes usage of 'cl' to identify which architecture is set.
+
+- iis: Renamves winbuild to dependencies - 1447766e816a896e88c9c8f053fcc3f62797bac1
+  Since the directory becomes all about dependencies there is no need to call it winbuild anymore.
+
+- iis: Removes unnecessary files from winbuild dir - 9f8cbf6ed8034ba42aa4967699308df09864fd18
+  Those .mak files seems to be part of an old build system. Since the script are now working fine, this commit removes all those .mac files and also a CMakeList.txt and the Makefile.win.
+
+- iis: Improves the iis build system - b277e538f28c87c81c1b50925dd8b82996b88294
+  Now checking for common errors while building. Refactoring on the build scripts, now there is this build_dependencies.bat script on the iis sub-folder. By calling this script all the dependencies should be build under the winbuild/. This commit also removes build scripts that were not needed anymore.
+
+- iis: Fixes the vcxproj file - a946a163f0ad822c760af80ca32dda61f0e6b2a9
+  Versions of the dependencies were changed, as long as the version of the Visual Studio, now 12.
+
+- iis: Removes unecessary files from the build system - 26738d2e34bcc7620047bd23180e0e26a64c71ee
+  The following files were removed:
+  * VCVarsQueryRegistry.bat
+  * vcvars64.bat
+  * vsvars32.bat
+The visual studio files can be called direcltly, not necessary to distribute those files, at least in VS12.
+
+- iss: Changes httpd version 2.4.6 - 0a772cb0748aa51a01800e0473309b9de792b456
+  Apache version was changed to 2.4.6 to sync with the current apache lounge version.
+
+- iis: Changes the version of the dependencies - 3e6fb41d36b7a5e98a55d8f52b88b29d1bd50b64
+  * pcre from 8.30 to 8.33
+  * zlib from 1.2.7 to 1.2.8
+  * libxml2 from 2.7.7 to 2.9.1
+  * curl from 7.24 to 7.33.0
+
+- Removes standalone/Makefile.in - e3c19d53d23c48fea337aae76a87b2a85c36a1f1
+  Makefile.in is recommended to be in the repository whenever it is edit manually, in our case the automatically generated Makefile.in is ok.
+
+
+Bug Fixes:
+
+- test: Avoids conflict of fuctions definition - cef72855e4106ce29e1d39103ebf9eb9ab28f17e
+
+- test: Makes the unit tests to work again - cc982ae42ec86c79a67be1a01c6ee35fb06c272c
+  The unit tests was not working due to lack update. This patch adds the necessary stuff to have it work again.
+
+- iis: Avoids directory link while building - ad330a44bfa39430cf6340cb52971568cccdf1d6
+  Build scripts was creating links allowing the project to be loaded into Visual Studio without care about the dependencies versions. Sometimes windows refuse to delete those links leading the script to fail. This patch moves the sources directories instead of create links to it.
+
+- QA: Avoids the utilization of 3rd filedescriptor - 69c5ccac662f4e11a6eefd54a3e912583c067b9d
+  No need to use a 3rd description on the quality check scripts. Stderr is now redirected to stdout and filtered as needed.
+
+- Supports WarningCountingShellCommand in cppcheck and vera - baaf502363e68c3240b60adb7f7c91f5b4f0ba03
+  WarningCountingShellCommand allow us to have some measurements on the buildbot waterfall.
+
+- iis: Using base_rules instead of activated_rules - 7b1537058fa451e0df7098cd907ef19f04102f9d
+
+- iis: Fix inet_pton build problem - a4202146b8d26b6615bbab986383fe0afae60d77
+  There is a function named inet_pton on windows API, with different signature. This patch just override the windows function and point the inet_pton to our implementation.
+
+- iis: Adds Wix installer xml file.c - b32cb7d9ab397160f0154aa4bd4e9638658b41e6
+  This commit adds the Wix template to our git repository.
+
+- iis: build_modsecurity.bat fixies - 7e03e3f840375ed682c35a5bb67932461cc77013
+  This commit enable a cleanup on the mod_security build directory avoiding symbols with different architectures.
+
+- iis: Fix mlogc build on windows - 9b7663fa79377a0685130a019916d810f31e7478
+  The libcurl path was not pointing to the correct directory
+
+- Fix #154, Uses addn instead of apr_table_setn - 1734221d9d3a78f9aafd68e35717da9ee1a4fe51
+  The headers are represented in the format of an apr_table, which is able to handle elements with the same key, however the function apr_table_setn checks if the key exists before add the element, if so it replaces the old value with the new one. This was making our implementation to just keep the last added Cookie. The apr_table_addn function, which is now used, just add a new item without check for olders one.
+
+- Merge pull request #579 from zimmerle/revert_139 - 61e54f2067ae760808359926ff91d57275df1aac
+  Revert merge request #139
+
+- Revert "Merge pull request #139 from chaizhenhua/remotes/trunk" - 7f7d00fa2c364716691df1b45779304b24a0debb
+  This reverts commit 10fd40fb0d06f6c577d870b6f15d2f6e2a3a5b1b, reversing changes made to 414033aafa94cd50c9b310afd3f164740caccc94.
+
+- Merge pull request #578 from client9/remotes/trunk - b0c3977845f60747b15ae10531b7d20355a22627
+  libinjection sync to v3.8.0
+
+- libinjection sync - a5f175d79fac1e69124da4e1e227b622e7e233d7
+
+- Merge pull request #152 from client9/remotes/trunk - 88ebf8a0bdbc4db1be76f3a2e70df77cc52a5925
+  Sync to libinjection v3.7.1
+
+- libinjection sync - fcb6dc13ed6efb066fb9b70405eecab8b83a2d96
+
+- libinjection sync - f52242a013f301ca5c17e59b662124833cb7cc6d
+
+- Merge pull request #148 from zimmerle/bugfix_charset_missing_string_terminator - b76e26d81ddafc2b99bffad53d1426f8fd33080a
+  Bugfix: missing string terminator while mounting the charset (nginx)
+
+- Bugfix: missing string terminator while mounting the charset (nginx) - ff19dcd5c53d4af61d0a9397d4616f47f80ee207
+  The charset in headers is mounted using ngx_snprintf which does not place the string terminator. This patch adds the terminator at the end of the string. The size was correctly allocated, just missing the terminator.
+
+- Merge pull request #141 from client9/remotes/trunk - 9a630eea23a7ead4e77617c86dc937fd7a421a57
+  libinjection sync to v3.6.0
+
+- libinjection sync - 11217207e8f2e0cf15742273836399866971071a
+
+- Merge pull request #139 from chaizhenhua/remotes/trunk - 10fd40fb0d06f6c577d870b6f15d2f6e2a3a5b1b
+  Fixed fd leackage after reload
+
+- Merge pull request #138 from client9/remotes/trunk - 414033aafa94cd50c9b310afd3f164740caccc94
+  libinjection sync
+
+- Fixed fd leackage after reload - e0993fcd7a166ce9e1a279a47d050af1311d9001
+
+- libinjection sync - 2268626c20260e88cab9b7830f8a06101fa7172a
+
+- Fix logical disjunction and conjunction issues - 7e0a9ecf7d492e85650671a0cfcfd53e5f15df2c
+
+Security Issues:
+
+- Fix Chunked string case sensitive issue - CVE-2013-5705 - f8d441cd25172fdfe5b613442fedfc0da3cc333d
+  (Thanks Martin Holst Swende - @mhswende)
+
+- Revert "Fix Chuncked string case sensitive issue" - 3901128f17e0763ac1a260106b79859d2aad6d90
+  This reverts commit 16a815a3c2735f62238ef99af26090a2b8430d3d.
+
+- Fix Chuncked string case sensitive issue - 16a815a3c2735f62238ef99af26090a2b8430d3d
+
+
+
+23 Jul 2013 - 2.7.5
+-------------------
+Improvements:
+
+    * SecUnicodeCodePage is deprecated. SecUnicodeMapFile now accepts the code page as a second parameter.
+
+    * Updated Libinjection to version 3.4.1. Many improvements were made.
+
+    * Severity action now supports strings (emergency, alert, critical, error, warning, notice, info, debug).
+
+Bug Fixes:
+
+    * Fixed utf8toUnicode tfn null byte conversion.
+
+    * Fixed NGINX crash when issue reload command.
+
+    * Fixed flush output buffer before inject modified hashed response body.
+
+    * Fixed url normalization for Hash Engine.
+
+    * Fixed NGINX ap_unixd_set_global_perms_mutex compilation error with apache 2.4 devel files.
+
+Security Issues:
+
+10 May 2013 - 2.7.4
+-------------------
+Improvements:
+
+    * Added Libinjection project http://www.client9.com/projects/libinjection/ as a new operator @detectSQLi. (Thanks Nick Galbreath).
+
+    * Added new variable SDBM_DELETE_ERROR that will be set to 1 when sdbm engine fails to delete entries.
+
+    * NGINX is now set to STABLE. Thanks chaizhenhua and all the people in community who help the project testing, sending feedback and patches.
+
+Bug Fixes:
+
+    * Fixed SecRulePerfTime storing unnecessary rules performance times.
+
+    * Fixed Possible SDBM deadlock condition.
+
+    * Fixed Possible @rsub memory leak.
+
+    * Fixed REMOTE_ADDR content will receive the client ip address when mod_remoteip.c is present.
+
+    * Fixed NGINX Audit engine in Concurrent mode was overwriting existing alert files because a issue with UNIQUE_ID.
+
+    * Fixed CPU 100% issue in NGINX port. This is also related to an memory leak when loading response body.
+
+Security Issues:
+
+    * Fixed Remote Null Pointer DeReference (CVE-2013-2765). When forceRequestBodyVariable action is triggered and a unknown Content-Type is used,
+      mod_security will crash trying to manipulate msr->msc_reqbody_chunks->elts however msr->msc_reqbody_chunks is NULL. (Thanks Younes JAAIDI).
+
 28 Mar 2013 - 2.7.3
 -------------------
 
@@ -32,7 +599,7 @@
 
   * SECURITY: Added SecXmlExternalEntity (On|Off - default it Off) that will disable
     by default the external entity load task executed by LibXml2. This is a security issue
-    reported by Timur Yunusov, Alexey Osipov (Positive Technologies).
+    [CVE-2013-1915] reported by Timur Yunusov, Alexey Osipov (Positive Technologies).
 
 21 Jan 2013 - 2.7.2
 -------------------
@@ -130,7 +697,7 @@
     support Include directive like Apache2.
 
   * Added MULTIPART_INVALID_PART flag. Also used in rule id 200002 for multipart strict
-    validation.
+    validation. https://www.sec-consult.com/fxdata/seccons/prod/temedia/advisories_txt/20121017-0_mod_security_ruleset_bypass.txt).
 
   * Updated Reference Manual.
 

@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -23,7 +23,14 @@
 #include "msc_util.h"
 
 #include <apr_lib.h>
+#include <apr_sha1.h>
 #include "modsecurity_config.h"
+
+#include "msc_remote_rules.h"
+
+#ifdef WITH_CURL
+#include "curl/curl.h"
+#endif
 
 /**
  * NOTE: Be careful as these can ONLY be used on static values for X.
@@ -120,8 +127,13 @@ char *utf8_unicode_inplace_ex(apr_pool_t *mp, unsigned char *input, long int inp
         if ((c & 0x80) == 0) {
             /* single byte unicode (7 bit ASCII equivilent) has no validation */
             count++;
-            if(count <= len)
-                *data++ = c;
+            if(count <= len)    {
+                if(c == 0)
+                    *data = x2c(&c);
+                else
+                    *data++ = c;
+            }
+
         }
         /* If first byte begins with binary 110 it is two byte encoding*/
         else if ((c & 0xE0) == 0xC0) {
@@ -231,7 +243,7 @@ char *utf8_unicode_inplace_ex(apr_pool_t *mp, unsigned char *input, long int inp
                 count+=7;
                 if(count <= len) {
                     /* compute character number */
-                    d = ((c & 0x07) << 18) | ((*(utf + 1) & 0x3F) << 12) | ((*(utf + 2) & 0x3F) < 6) | (*(utf + 3) & 0x3F);
+                    d = ((c & 0x07) << 18) | ((*(utf + 1) & 0x3F) << 12) | ((*(utf + 2) & 0x3F) << 6) | (*(utf + 3) & 0x3F);
                     *data++ = '%';
                     *data++ = 'u';
                     unicode = apr_psprintf(mp, "%x", d);
@@ -359,12 +371,12 @@ unsigned char is_netmask_v6(char *ip_strv6) {
     if ((mask_str = strchr(ip_strv6, '/'))) {
         *(mask_str++) = '\0';
 
-        if (strchr(mask_str, '.') != NULL) {
+        if (strchr(mask_str, ':') != NULL) {
             return 0;
         }
 
         cidr = atoi(mask_str);
-        if ((cidr < 0) || (cidr > 64)) {
+        if ((cidr < 0) || (cidr > 128)) {
             return 0;
         }
         netmask_v6 = (unsigned char)cidr;
@@ -831,6 +843,7 @@ char *m_strcasestr(const char *haystack, const char *needle) {
 }
 
 #ifdef WIN32
+#if !(NTDDI_VERSION >= NTDDI_VISTA)
 int inet_pton(int family, const char *src, void *dst)   {
     struct addrinfo addr;
     struct sockaddr_in *in = NULL;
@@ -869,6 +882,7 @@ int inet_pton(int family, const char *src, void *dst)   {
 
     return -1;
 }
+#endif
 #endif
 
 /**
@@ -2381,3 +2395,440 @@ char *construct_single_var(modsec_rec *msr, char *name) {
 
     return (char *)vx->value;
 }
+
+/**
+ * @brief Transforms an apr_array_header_t to a text buffer
+ *
+ * Converts an apr_array_header_t into a plain/text buffer in a Key: Pair
+ * format. The generated buffer is not null terminated.
+ *
+ * If called with `buffer_length` set to 0 or with `buffer` set to NULL,
+ * it will _not_ fill any buffer, instead, it will return the length, that
+ * will be needed to save the entire content of `arr` into a buffer.
+ *
+ * @warning return is not NULL-terminated.
+ * @note memory management is in the responsibility of the caller.
+ *
+ * @param arr apr_array_header_t to be iterated.
+ * @param buffer pointer to the destination buffer.
+ * @param buffer_length length that will fully fill the buffer.
+ * @retval -1 Something went wrong in the process. Do not trust in
+ *            buffer content.
+ * @retval n>0 size of the [needed|] buffer.
+ *
+ */
+int msc_headers_to_buffer(const apr_array_header_t *arr, char *buffer,
+        int buffer_length)
+{
+    int headers_length = 0;
+    int write_to_buffer = 0;
+    int i = 0;
+    const apr_table_entry_t *te = NULL;
+
+    if (buffer != NULL && buffer_length > 0) {
+        write_to_buffer = 1;
+    }
+
+    te = (apr_table_entry_t *)arr->elts;
+    for (i = 0; i < arr->nelts; i++) {
+            char *value = te[i].val;
+            char *key = te[i].key;
+            headers_length = headers_length + strlen(value) + strlen(key) + /* \n: */ 1 +
+               /* colum */ 1 + /* space: */ 1 ;
+
+            if (write_to_buffer == 1) {
+                if (buffer_length < headers_length) {
+                    headers_length = -1;
+                    goto not_enough_memory;
+                }
+
+                sprintf(buffer, "%s%s: %s\n", buffer, key, value);
+            }
+    }
+
+    headers_length++; /* Save space for an extra '\n' between the hedaers and the request body */
+    if (write_to_buffer) {
+        if (buffer_length < headers_length) {
+            headers_length = -1;
+            goto not_enough_memory;
+        }
+
+        buffer[headers_length-1] = '\n';
+    }
+
+not_enough_memory:
+    return headers_length;
+}
+
+int read_line(char *buf, int len, FILE *fp)
+{
+    char *tmp;
+
+    if (buf == NULL)
+    {
+        return -1;
+    }
+
+    memset(buf, '\0', len*sizeof(char));
+
+    if (fgets(buf, len, fp) == NULL)
+    {
+        *buf = '\0';
+        return 0;
+    }
+    else
+    {
+        if ((tmp = strrchr(buf, '\n')) != NULL)
+        {
+            *tmp = '\0';
+        }
+    }
+
+    return 1;
+}
+
+int create_radix_tree(apr_pool_t *mp, TreeRoot **rtree, char **error_msg)
+{
+    *rtree = apr_palloc(mp, sizeof(TreeRoot));
+    if (*rtree == NULL)
+    {
+        *error_msg = apr_psprintf(mp, "Failed allocating " \
+            "memory to TreeRoot.");
+        goto root_node_failed;
+    }
+    memset(*rtree, 0, sizeof(TreeRoot));
+
+    (*rtree)->ipv4_tree = CPTCreateRadixTree(mp);
+    if ((*rtree)->ipv4_tree == NULL)
+    {
+        *error_msg = apr_psprintf(mp, "IPmatch: Tree initialization " \
+            "failed.");
+        goto ipv4_tree_failed;
+    }
+
+    (*rtree)->ipv6_tree = CPTCreateRadixTree(mp);
+    if ((*rtree)->ipv6_tree == NULL)
+    {
+        *error_msg = apr_psprintf(mp, "IPmatch: Tree initialization " \
+            "failed.");
+        goto ipv6_tree_failed;
+    }
+
+    return 0;
+
+ipv6_tree_failed:
+ipv4_tree_failed:
+root_node_failed:
+    return -1;
+}
+
+
+int ip_tree_from_file(TreeRoot **rtree, char *uri,
+    apr_pool_t *mp, char **error_msg)
+{
+    TreeNode *tnode = NULL;
+    apr_status_t rc;
+    int line = 0;
+    apr_file_t *fd;
+    char *start;
+    char *end;
+    char buf[HUGE_STRING_LEN + 1]; // FIXME: 2013-10-29 zimmerle: dynamic?
+    char errstr[1024];             //
+
+    if (create_radix_tree(mp, rtree, error_msg))
+    {
+        return -1;
+    }
+
+    rc = apr_file_open(&fd, uri, APR_READ | APR_BUFFERED | APR_FILE_NOCLEANUP,
+        0, mp);
+
+    if (rc != APR_SUCCESS)
+    {
+        *error_msg = apr_psprintf(mp, "Could not open ipmatch file \"%s\": %s",
+            uri, apr_strerror(rc, errstr, 1024));
+        return -1;
+    }
+
+    while ((rc = apr_file_gets(buf, HUGE_STRING_LEN, fd)) != APR_EOF)
+    {
+        line++;
+        if (rc != APR_SUCCESS)
+        {
+            *error_msg = apr_psprintf(mp, "Could not read \"%s\" line %d: %s", 
+                uri, line, apr_strerror(rc, errstr, 1024));
+            return -1;
+        }
+
+        start = buf;
+
+        while ((apr_isspace(*start) != 0) && (*start != '\0'))
+        {
+            start++;
+        }
+
+        for (end = start; end != NULL || *end != '\0' || *end != '\n'; end++)
+        {
+            if (apr_isxdigit(*end) || *end == '.' || *end == '/' || *end == ':')
+            {
+                continue;
+            }
+
+            if (*end != '\n')
+            {
+                *error_msg = apr_psprintf(mp, "Invalid char \"%c\" in line %d " \
+                    "of file %s", *end, line, uri);
+            }
+
+            break;
+        }
+
+        *end = '\0';
+
+        if ((start == end) || (*start == '#'))
+        {
+            continue;
+        }
+
+        if (strchr(start, ':') == NULL)
+        {
+            tnode = TreeAddIP(start, (*rtree)->ipv4_tree, IPV4_TREE);
+        }
+#if APR_HAVE_IPV6
+        else
+        {
+            tnode = TreeAddIP(start, (*rtree)->ipv6_tree, IPV6_TREE);
+        }
+#endif
+
+        if (tnode == NULL)
+        {
+            *error_msg = apr_psprintf(mp, "Could not add entry " \
+                "\"%s\" in line %d of file %s to IP list", start, line, uri);
+            return -1;
+        }
+    }
+
+    if (fd != NULL)
+    {
+        apr_file_close(fd);
+    }
+
+    return 0;
+}
+
+#ifdef WITH_CURL
+int ip_tree_from_uri(TreeRoot **rtree, char *uri,
+    apr_pool_t *mp, char **error_msg)
+{
+    TreeNode *tnode = NULL;
+    apr_status_t rc;
+    int line = 0;
+    apr_file_t *fd;
+    char *start;
+    int res;
+
+    struct msc_curl_memory_buffer_t chunk;
+    char *word = NULL;
+    char *brkt = NULL;
+    char *sep = "\n";
+
+    if (create_radix_tree(mp, rtree, error_msg))
+    {
+        return -1;
+    }
+
+    res = msc_remote_download_content(mp, uri, NULL, &chunk, error_msg);
+    if (res)
+    {
+        return res;
+    }
+
+    for (word = strtok_r(chunk.memory, sep, &brkt);
+         word;
+         word = strtok_r(NULL, sep, &brkt))
+    {
+        int i = 0;
+        line++;
+
+        /* Ignore empty lines and comments */
+        if (*word == '#') continue;
+
+        for (i = 0; i < strlen(word); i++)
+        {
+            if (apr_isxdigit(word[i]) || word[i] == '.' || word[i] == '/' || word[i] == ':' || word[i] == '\n')
+            {
+                continue;
+            }
+
+            *error_msg = apr_psprintf(mp, "Invalid char \"%c\" in line %d " \
+                "of uri %s", word[i], line, uri);
+            return -1;
+        }
+
+        if (strchr(word, ':') == NULL)
+        {
+            tnode = TreeAddIP(word, (*rtree)->ipv4_tree, IPV4_TREE);
+        }
+#if APR_HAVE_IPV6
+        else
+        {
+            tnode = TreeAddIP(word, (*rtree)->ipv6_tree, IPV6_TREE);
+        }
+#endif
+
+        if (tnode == NULL)
+        {
+            *error_msg = apr_psprintf(mp, "Could not add entry " \
+                "\"%s\" in line %d of file %s to IP list", word, line, uri);
+            return -1;
+        }
+
+    }
+
+    msc_remote_clean_chunk(&chunk);
+
+    return 0;
+}
+#endif
+
+int tree_contains_ip(apr_pool_t *mp, TreeRoot *rtree,
+    const char *value, modsec_rec *msr, char **error_msg)
+{
+    struct in_addr in;
+#if APR_HAVE_IPV6
+    struct in6_addr in6;
+#endif
+
+    if (rtree == NULL)
+    {
+        return 0;
+    }
+
+    if (strchr(value, ':') == NULL) {
+        if (inet_pton(AF_INET, value, &in) <= 0) {
+            *error_msg = apr_psprintf(mp, "IPmatch: bad IPv4 " \
+                "specification \"%s\".", value);
+            return -1;
+        }
+
+        if (CPTIpMatch(msr, (unsigned char *)&in.s_addr, rtree->ipv4_tree,
+            IPV4_TREE) != NULL) {
+            return 1;
+        }
+    }
+#if APR_HAVE_IPV6
+    else {
+        if (inet_pton(AF_INET6, value, &in6) <= 0) {
+            *error_msg = apr_psprintf(mp, "IPmatch: bad IPv6 " \
+                "specification \"%s\".", value);
+            return -1;
+        }
+
+        if (CPTIpMatch(msr, (unsigned char *)&in6.s6_addr, rtree->ipv6_tree,
+            IPV6_TREE) != NULL) {
+            return 1;
+        }
+    }
+#endif
+
+    return 0;
+}
+
+int ip_tree_from_param(apr_pool_t *mp,
+    char *param, TreeRoot **rtree, char **error_msg)
+{
+    char *saved = NULL;
+    char *str = NULL;
+    TreeNode *tnode = NULL;
+
+    if (create_radix_tree(mp, rtree, error_msg))
+    {
+        return -1;
+    }
+
+    str = apr_strtok(param, ",", &saved);
+    while (str != NULL)
+    {
+        if (strchr(str, ':') == NULL)
+        {
+            tnode = TreeAddIP(str, (*rtree)->ipv4_tree, IPV4_TREE);
+        }
+#if APR_HAVE_IPV6
+        else
+        {
+            tnode = TreeAddIP(str, (*rtree)->ipv6_tree, IPV6_TREE);
+        }
+#endif
+        if (tnode == NULL)
+        {
+            *error_msg = apr_psprintf(mp, "Could not add entry " \
+                "\"%s\" from: %s.", str, param);
+            return -1;
+        }
+
+        str = apr_strtok(NULL, ",", &saved);
+    }
+
+    return 0;
+}
+
+#ifdef WITH_CURL
+size_t msc_curl_write_memory_cb(void *contents, size_t size,
+        size_t nmemb, void *userp)
+{
+    size_t realsize = size * nmemb;
+    struct msc_curl_memory_buffer_t *mem = (struct msc_curl_memory_buffer_t *)userp;
+
+    if (mem->size == 0)
+    {
+        mem->memory = malloc(realsize + 1);
+        memset(mem->memory, '\0', sizeof(realsize + 1));
+    }
+    else
+    {
+        mem->memory = realloc(mem->memory, mem->size + realsize + 1);
+        memset(mem->memory + mem->size, '\0', sizeof(realsize + 1));
+    }
+
+    if (mem->memory == NULL) {
+        /* out of memory! */
+        return 0;
+    }
+
+    memcpy(&(mem->memory[mem->size]), contents, realsize);
+    mem->size += realsize;
+    mem->memory[mem->size] = 0;
+
+    return realsize;
+}
+#endif
+
+#ifdef WIN32
+char* strtok_r(
+        char *str,
+        const char *delim,
+        char **nextp)
+{
+    char *ret;
+
+    if (str == NULL)
+    {
+        str = *nextp;
+    }
+    str += strspn(str, delim);
+    if (*str == '\0')
+    {
+        return NULL;
+    }
+    ret = str;
+    str += strcspn(str, delim);
+    if (*str)
+    {
+        *str++ = '\0';
+    }
+    *nextp = str;
+    return ret;
+}
+#endif
+

@@ -1,6 +1,6 @@
 /*
  * ModSecurity for Apache 2.x, http://www.modsecurity.org/
- * Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+ * Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
  *
  * You may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
@@ -139,12 +139,14 @@ apr_status_t input_filter(ap_filter_t *f, apr_bucket_brigade *bb_out,
     if (rc == 0) {
         modsecurity_request_body_retrieve_end(msr);
 
-        bucket = apr_bucket_eos_create(f->r->connection->bucket_alloc);
-        if (bucket == NULL) return APR_EGENERAL;
-        APR_BRIGADE_INSERT_TAIL(bb_out, bucket);
+        if (msr->if_seen_eos) {
+            bucket = apr_bucket_eos_create(f->r->connection->bucket_alloc);
+            if (bucket == NULL) return APR_EGENERAL;
+            APR_BRIGADE_INSERT_TAIL(bb_out, bucket);
 
-        if (msr->txcfg->debuglog_level >= 4) {
-            msr_log(msr, 4, "Input filter: Sent EOS.");
+            if (msr->txcfg->debuglog_level >= 4) {
+                msr_log(msr, 4, "Input filter: Sent EOS.");
+            }
         }
 
         /* We're done */
@@ -164,7 +166,7 @@ apr_status_t input_filter(ap_filter_t *f, apr_bucket_brigade *bb_out,
  */
 apr_status_t read_request_body(modsec_rec *msr, char **error_msg) {
     request_rec *r = msr->r;
-    unsigned int seen_eos;
+    unsigned int finished_reading;
     apr_bucket_brigade *bb_in;
     apr_bucket *bucket;
 
@@ -193,7 +195,8 @@ apr_status_t read_request_body(modsec_rec *msr, char **error_msg) {
         return -1;
     }
 
-    seen_eos = 0;
+    finished_reading = 0;
+    msr->if_seen_eos = 0;
     bb_in = apr_brigade_create(msr->mp, r->connection->bucket_alloc);
     if (bb_in == NULL) return -1;
     do {
@@ -205,6 +208,9 @@ apr_status_t read_request_body(modsec_rec *msr, char **error_msg) {
              *      too large and APR_EGENERAL when the client disconnects.
              */
             switch(rc) {
+                case APR_INCOMPLETE :
+                    *error_msg = apr_psprintf(msr->mp, "Error reading request body: %s", get_apr_error(msr->mp, rc));
+                    return -7;
                 case APR_EOF :
                     *error_msg = apr_psprintf(msr->mp, "Error reading request body: %s", get_apr_error(msr->mp, rc));
                     return -6;
@@ -283,6 +289,11 @@ apr_status_t read_request_body(modsec_rec *msr, char **error_msg) {
 
             if (buflen != 0) {
                 int rcbs = modsecurity_request_body_store(msr, buf, buflen, error_msg);
+
+                if (msr->reqbody_length > (apr_size_t)msr->txcfg->reqbody_limit && msr->txcfg->if_limit_action == REQUEST_BODY_LIMIT_ACTION_PARTIAL) {
+                    finished_reading = 1;
+                }
+
                 if (rcbs < 0) {
                     if (rcbs == -5) {
                         if((msr->txcfg->is_enabled == MODSEC_ENABLED) && (msr->txcfg->if_limit_action == REQUEST_BODY_LIMIT_ACTION_REJECT)) {
@@ -309,12 +320,13 @@ apr_status_t read_request_body(modsec_rec *msr, char **error_msg) {
             }
 
             if (APR_BUCKET_IS_EOS(bucket)) {
-                seen_eos = 1;
+                finished_reading = 1;
+                msr->if_seen_eos = 1;
             }
         }
 
         apr_brigade_cleanup(bb_in);
-    } while(!seen_eos);
+    } while(!finished_reading);
 
     // TODO: Why ignore the return code here?
     modsecurity_request_body_end(msr, error_msg);
@@ -588,7 +600,7 @@ static int flatten_response_body(modsec_rec *msr) {
         }
 
         memset(msr->stream_output_data, 0, msr->stream_output_length+1);
-        strncpy(msr->stream_output_data, msr->resbody_data, msr->stream_output_length);
+        memcpy(msr->stream_output_data, msr->resbody_data, msr->stream_output_length);
         msr->stream_output_data[msr->stream_output_length] = '\0';
     } else if (msr->txcfg->stream_outbody_inspection && msr->txcfg->hash_is_enabled == HASH_ENABLED)    {
         int retval = 0;
@@ -600,8 +612,12 @@ static int flatten_response_body(modsec_rec *msr) {
             retval = hash_response_body_links(msr);
             if(retval > 0) {
                 retval = inject_hashed_response_body(msr, retval);
-                if (msr->txcfg->debuglog_level >= 4) {
-                    msr_log(msr, 4, "Hash completed in %" APR_TIME_T_FMT " usec.", (apr_time_now() - time1));
+                if(retval < 0){
+                    msr_log(msr, 1, "inject_hashed_response_body: Unable to inject hash into response body. Returning response without changes." );
+                }else{
+                    if (msr->txcfg->debuglog_level >= 4) {
+                        msr_log(msr, 4, "Hash completed in %" APR_TIME_T_FMT " usec.", (apr_time_now() - time1));
+                    }
                 }
 
             }
@@ -617,7 +633,7 @@ static int flatten_response_body(modsec_rec *msr) {
             }
 
             memset(msr->stream_output_data, 0, msr->stream_output_length+1);
-            strncpy(msr->stream_output_data, msr->resbody_data, msr->stream_output_length);
+            memcpy(msr->stream_output_data, msr->resbody_data, msr->stream_output_length);
             msr->stream_output_data[msr->stream_output_length] = '\0';
         }
     }

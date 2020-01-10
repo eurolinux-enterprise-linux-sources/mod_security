@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -19,8 +19,13 @@
 #include "modsecurity.h"
 #include "msc_parsers.h"
 #include "msc_util.h"
+#include "msc_json.h"
 #include "msc_xml.h"
 #include "apr_version.h"
+
+#ifdef WITH_CURL
+#include <curl/curl.h>
+#endif
 
 unsigned long int DSOLOCAL unicode_codepage = 0;
 
@@ -117,6 +122,16 @@ msc_engine *modsecurity_create(apr_pool_t *mp, int processing_mode) {
 int modsecurity_init(msc_engine *msce, apr_pool_t *mp) {
     apr_status_t rc;
 
+    /**
+     * Notice that curl is initialized here but never cleaned up. First version
+     * of this implementation curl was initialized and cleaned for every
+     * utilization. Turns out that it was not only cleaning stuff that was
+     * utilized by Curl but also other OpenSSL stuff that was utilized by
+     * mod_ssl leading the SSL support to crash.
+     */
+#ifdef WITH_CURL
+    curl_global_init(CURL_GLOBAL_ALL);
+#endif
     /* Serial audit log mutext */
     rc = apr_global_mutex_create(&msce->auditlog_lock, NULL, APR_LOCK_DEFAULT, mp);
     if (rc != APR_SUCCESS) {
@@ -154,6 +169,24 @@ int modsecurity_init(msc_engine *msce, apr_pool_t *mp) {
         return -1;
     }
 #endif /* SET_MUTEX_PERMS */
+
+#ifdef GLOBAL_COLLECTION_LOCK
+    rc = apr_global_mutex_create(&msce->dbm_lock, NULL, APR_LOCK_DEFAULT, mp);
+    if (rc != APR_SUCCESS) {
+        return -1;
+    }
+
+#ifdef __SET_MUTEX_PERMS
+#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2
+    rc = ap_unixd_set_global_mutex_perms(msce->dbm_lock);
+#else
+    rc = unixd_set_global_mutex_perms(msce->dbm_lock);
+#endif
+    if (rc != APR_SUCCESS) {
+        return -1;
+    }
+#endif /* SET_MUTEX_PERMS */
+#endif
 #endif
 
     return 1;
@@ -179,6 +212,15 @@ void modsecurity_child_init(msc_engine *msce) {
             // ap_log_error(APLOG_MARK, APLOG_ERR, rs, s, "Failed to child-init geo mutex");
         }
     }
+
+#ifdef GLOBAL_COLLECTION_LOCK
+    if (msce->dbm_lock != NULL) {
+        apr_status_t rc = apr_global_mutex_child_init(&msce->dbm_lock, NULL, msce->mp);
+        if (rc != APR_SUCCESS) {
+            // ap_log_error(APLOG_MARK, APLOG_ERR, rs, s, "Failed to child-init dbm mutex");
+        }
+    }
+#endif
 
 }
 
@@ -222,9 +264,11 @@ static void modsecurity_persist_data(modsec_rec *msr) {
     }
 
     /* Remove stale collections. */
-    srand(time(NULL));
-
+#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 3
+    if (ap_random_pick(0, RAND_MAX) < RAND_MAX/100) {
+#else
     if (rand() < RAND_MAX/100) {
+#endif
         arr = apr_table_elts(msr->collections);
         te = (apr_table_entry_t *)arr->elts;
         for (i = 0; i < arr->nelts; i++) {
@@ -255,10 +299,21 @@ static apr_status_t modsecurity_tx_cleanup(void *data) {
     /* XML processor cleanup. */
     if (msr->xml != NULL) xml_cleanup(msr);
 
+#ifdef WITH_YAJL
+    /* JSON processor cleanup. */
+    if (msr->json != NULL) json_cleanup(msr);
+#endif
+
     // TODO: Why do we ignore return code here?
     modsecurity_request_body_clear(msr, &my_error_msg);
     if (my_error_msg != NULL) {
         msr_log(msr, 1, "%s", my_error_msg);
+    }
+
+    if (msr->msc_full_request_length > 0 &&
+            msr->msc_full_request_buffer != NULL) {
+        msr->msc_full_request_length = 0;
+        free(msr->msc_full_request_buffer);
     }
 
 #if defined(WITH_LUA)
@@ -297,7 +352,7 @@ apr_status_t modsecurity_tx_init(modsec_rec *msr) {
     if (msr->request_content_length == -1) {
         /* There's no C-L, but is chunked encoding used? */
         char *transfer_encoding = (char *)apr_table_get(msr->request_headers, "Transfer-Encoding");
-        if ((transfer_encoding != NULL)&&(strstr(transfer_encoding, "chunked") != NULL)) {
+        if ((transfer_encoding != NULL)&&(m_strcasestr(transfer_encoding, "chunked") != NULL)) {
             msr->reqbody_should_exist = 1;
             msr->reqbody_chunked = 1;
         }
@@ -391,11 +446,9 @@ apr_status_t modsecurity_tx_init(modsec_rec *msr) {
     if (msr->matched_vars == NULL) return -1;
     apr_table_clear(msr->matched_vars);
 
-    if(msr->txcfg->max_rule_time > 0)   {
-        msr->perf_rules = apr_table_make(msr->mp, 8);
-        if (msr->perf_rules == NULL) return -1;
-        apr_table_clear(msr->perf_rules);
-    }
+    msr->perf_rules = apr_table_make(msr->mp, 8);
+    if (msr->perf_rules == NULL) return -1;
+    apr_table_clear(msr->perf_rules);
 
     /* Locate the cookie headers and parse them */
     arr = apr_table_elts(msr->request_headers);
@@ -526,7 +579,7 @@ static apr_status_t modsecurity_process_phase_request_body(modsec_rec *msr) {
     apr_time_t time_before;
     apr_status_t rc = 0;
 
-    
+
     if ((msr->allow_scope == ACTION_ALLOW_REQUEST)||(msr->allow_scope == ACTION_ALLOW)) {
         if (msr->txcfg->debuglog_level >= 4) {
             msr_log(msr, 4, "Skipping phase REQUEST_BODY (allow used).");
@@ -616,7 +669,7 @@ static apr_status_t modsecurity_process_phase_response_body(modsec_rec *msr) {
  */
 static apr_status_t modsecurity_process_phase_logging(modsec_rec *msr) {
     apr_time_t time_before, time_after;
-    
+
     if (msr->txcfg->debuglog_level >= 4) {
         msr_log(msr, 4, "Starting phase LOGGING.");
     }

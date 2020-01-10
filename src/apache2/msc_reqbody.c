@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -127,6 +127,21 @@ apr_status_t modsecurity_request_body_start(modsec_rec *msr, char **error_msg) {
                 msr_log(msr, 2, "%s", *error_msg);
             }
         }
+        else if (strcmp(msr->msc_reqbody_processor, "JSON") == 0) {
+#ifdef WITH_YAJL
+            if (json_init(msr, &my_error_msg) < 0) {
+                *error_msg = apr_psprintf(msr->mp, "JSON parsing error (init): %s", my_error_msg);
+                msr->msc_reqbody_error = 1;
+                msr->msc_reqbody_error_msg = my_error_msg;
+                msr_log(msr, 2, "%s", *error_msg);
+            }
+#else
+            *error_msg = apr_psprintf(msr->mp, "JSON support was not enabled");
+            msr->msc_reqbody_error = 1;
+            msr->msc_reqbody_error_msg = my_error_msg;
+            msr_log(msr, 2, "%s", *error_msg);
+#endif
+        }
         else if (strcmp(msr->msc_reqbody_processor, "URLENCODED") == 0) {
             /* Do nothing, URLENCODED processor does not support streaming yet. */
         }
@@ -170,6 +185,7 @@ static apr_status_t modsecurity_request_body_store_memory(modsec_rec *msr,
 
     /* Would storing this chunk mean going over the limit? */
     if ((msr->msc_reqbody_spilltodisk)
+        && (msr->txcfg->reqbody_buffering != REQUEST_BODY_FORCEBUF_ON)
         && (msr->msc_reqbody_length + length > (apr_size_t)msr->txcfg->reqbody_inmemory_limit))
     {
         msc_data_chunk **chunks;
@@ -342,6 +358,25 @@ apr_status_t modsecurity_request_body_store(modsec_rec *msr,
                 msr->msc_reqbody_error_msg = *error_msg;
                 msr_log(msr, 2, "%s", *error_msg);
             }
+        }
+        else if (strcmp(msr->msc_reqbody_processor, "JSON") == 0) {
+            /* Increase per-request data length counter. */
+            msr->msc_reqbody_no_files_length += length;
+
+            /* Process data as JSON. */
+#ifdef WITH_YAJL
+            if (json_process_chunk(msr, data, length, &my_error_msg) < 0) {
+                *error_msg = apr_psprintf(msr->mp, "JSON parsing error: %s", my_error_msg);
+                msr->msc_reqbody_error = 1;
+                msr->msc_reqbody_error_msg = *error_msg;
+                msr_log(msr, 2, "%s", *error_msg);
+            }
+#else
+            *error_msg = apr_psprintf(msr->mp, "JSON support was not enabled");
+            msr->msc_reqbody_error = 1;
+            msr->msc_reqbody_error_msg = *error_msg;
+            msr_log(msr, 2, "%s", *error_msg);
+#endif
         }
         else if (strcmp(msr->msc_reqbody_processor, "URLENCODED") == 0) {
             /* Increase per-request data length counter. */
@@ -600,6 +635,24 @@ apr_status_t modsecurity_request_body_end(modsec_rec *msr, char **error_msg) {
                 return -1;
             }
         }
+        else if (strcmp(msr->msc_reqbody_processor, "JSON") == 0) {
+#ifdef WITH_YAJL
+            if (json_complete(msr, &my_error_msg) < 0) {
+                *error_msg = apr_psprintf(msr->mp, "JSON parser error: %s", my_error_msg);
+                msr->msc_reqbody_error = 1;
+                msr->msc_reqbody_error_msg = *error_msg;
+                msr_log(msr, 2, "%s", *error_msg);
+                 return -1;
+             }
+#else
+            *error_msg = apr_psprintf(msr->mp, "JSON support was not enabled");
+            msr->msc_reqbody_error = 1;
+            msr->msc_reqbody_error_msg = *error_msg;
+            msr_log(msr, 2, "%s", *error_msg);
+            return -1;
+#endif
+
+        }
         else if (strcmp(msr->msc_reqbody_processor, "URLENCODED") == 0) {
             return modsecurity_request_body_end_urlencoded(msr, error_msg);
         }
@@ -835,6 +888,11 @@ apr_status_t modsecurity_request_body_clear(modsec_rec *msr, char **error_msg) {
                 const char *put_filename = NULL;
                 const char *put_basename = NULL;
 
+                if (strcmp(msr->txcfg->upload_dir, msr->txcfg->tmp_dir) == 0) {
+                    msr_log(msr, 4, "Not moving file to identical location.");
+                    goto nullify;
+                }
+
                 /* Construct the new filename. */
                 put_basename = file_basename(msr->msc_reqbody_mp, msr->msc_reqbody_filename);
                 if (put_basename == NULL) {
@@ -879,6 +937,8 @@ apr_status_t modsecurity_request_body_clear(modsec_rec *msr, char **error_msg) {
                 msr_log(msr, 4, "Input filter: Removed temporary file: %s",
                     msr->msc_reqbody_filename);
             }
+
+nullify:
 
             msr->msc_reqbody_filename = NULL;
         }

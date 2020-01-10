@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -77,6 +77,18 @@ static unsigned char buf[BUFLEN];
 msc_engine *modsecurity = NULL;
 unsigned long int DSOLOCAL msc_pcre_match_limit = 0;
 unsigned long int DSOLOCAL msc_pcre_match_limit_recursion = 0;
+char DSOLOCAL *real_server_signature = NULL;
+int DSOLOCAL remote_rules_fail_action = REMOTE_RULES_ABORT_ON_FAIL;
+char DSOLOCAL *remote_rules_fail_message = NULL;
+module AP_MODULE_DECLARE_DATA security2_module = {
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL
+};
 
 /* Stubs */
 char *format_error_log_message(apr_pool_t *mp, error_message_t *em) {
@@ -178,7 +190,8 @@ void msr_log_warn(modsec_rec *msr, const char *text, ...) {
     va_end(ap);
 }
 
-const char *ap_get_remote_host(conn_rec *conn, void *dir_config, int type, int *str_is_ip) {
+#define ap_get_remote_host(a, b, c, d) test_ap_get_remote_host(a, b, c, d)
+const char *test_ap_get_remote_host(conn_rec *conn, void *dir_config, int type, int *str_is_ip) {
     return "FAKE-REMOTE-HOST";
 }
 
@@ -186,11 +199,13 @@ char *get_env_var(request_rec *r, char *name) {
     return "FAKE-ENV-VAR";
 }
 
-apr_status_t unixd_set_global_mutex_perms(apr_global_mutex_t *gmutex) {
+#define unixd_set_global_mutex_perms(a) my_unixd_set_global_mutex_perms(a)
+apr_status_t my_unixd_set_global_mutex_perms(apr_global_mutex_t *gmutex) {
     return APR_SUCCESS;
 }
 
-apr_status_t unixd_set_proc_mutex_perms(apr_proc_mutex_t *pmutex) {
+#define unixd_set_proc_mutex_perms(a) my_unixd_set_proc_mutex_perms(a)
+apr_status_t my_unixd_set_proc_mutex_perms(apr_proc_mutex_t *pmutex) {
     return APR_SUCCESS;
 }
 

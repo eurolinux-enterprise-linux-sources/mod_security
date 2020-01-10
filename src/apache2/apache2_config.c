@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -73,6 +73,9 @@ void *create_directory_config(apr_pool_t *mp, char *path)
     /* audit log variables */
     dcfg->auditlog_flag = NOT_SET;
     dcfg->auditlog_type = NOT_SET;
+    #ifdef WITH_YAJL
+    dcfg->auditlog_format = NOT_SET;
+    #endif
     dcfg->max_rule_time = NOT_SET;
     dcfg->auditlog_dirperms = NOT_SET;
     dcfg->auditlog_fileperms = NOT_SET;
@@ -256,13 +259,31 @@ static void copy_rules_phase(apr_pool_t *mp,
 }
 
 /**
- * Copies rules between two configuration contexts,
+ * @brief Copies rules between one phase of two configuration contexts.
+ *
+ * Copies rules between one phase of two configuration contexts,
  * taking exceptions into account.
+ *
+ * @param mp apr pool structure
+ * @param parent_ruleset Parent's msre_ruleset
+ * @param child_ruleset Child's msre_ruleset
+ * @param exceptions_arr Exceptions' apr_array_header_t
+ * @retval 0 Everything went well.
+ * @retval -1 Something went wrong.
+ *
  */
 static int copy_rules(apr_pool_t *mp, msre_ruleset *parent_ruleset,
                       msre_ruleset *child_ruleset,
                       apr_array_header_t *exceptions_arr)
 {
+    int ret = 0;
+
+    if (parent_ruleset == NULL || child_ruleset == NULL ||
+            exceptions_arr == NULL) {
+        ret = -1;
+        goto failed;
+    }
+
     copy_rules_phase(mp, parent_ruleset->phase_request_headers,
         child_ruleset->phase_request_headers, exceptions_arr);
     copy_rules_phase(mp, parent_ruleset->phase_request_body,
@@ -274,7 +295,8 @@ static int copy_rules(apr_pool_t *mp, msre_ruleset *parent_ruleset,
     copy_rules_phase(mp, parent_ruleset->phase_logging,
         child_ruleset->phase_logging, exceptions_arr);
 
-    return 1;
+failed:
+    return ret;
 }
 
 /**
@@ -393,6 +415,7 @@ void *merge_directory_configs(apr_pool_t *mp, void *_parent, void *_child)
 
             /* Copy the rules from the parent context. */
             merged->ruleset = msre_ruleset_create(parent->ruleset->engine, mp);
+            /* TODO: copy_rules return code should be taken into consideration. */
             copy_rules(mp, parent->ruleset, merged->ruleset, child->rule_exceptions);
         } else
         if (parent->ruleset == NULL) {
@@ -419,6 +442,7 @@ void *merge_directory_configs(apr_pool_t *mp, void *_parent, void *_child)
 
             /* Copy parent rules, then add child rules to it. */
             merged->ruleset = msre_ruleset_create(parent->ruleset->engine, mp);
+            /* TODO: copy_rules return code should be taken into consideration. */
             copy_rules(mp, parent->ruleset, merged->ruleset, child->rule_exceptions);
 
             apr_array_cat(merged->ruleset->phase_request_headers,
@@ -482,6 +506,10 @@ void *merge_directory_configs(apr_pool_t *mp, void *_parent, void *_child)
         merged->auditlog2_fd = parent->auditlog2_fd;
         merged->auditlog2_name = parent->auditlog2_name;
     }
+    #ifdef WITH_YAJL
+    merged->auditlog_format = (child->auditlog_format == NOT_SET
+        ? parent->auditlog_format : child->auditlog_format);
+    #endif
     merged->auditlog_storage_dir = (child->auditlog_storage_dir == NOT_SET_P
         ? parent->auditlog_storage_dir : child->auditlog_storage_dir);
     merged->auditlog_parts = (child->auditlog_parts == NOT_SET_P
@@ -646,6 +674,9 @@ void init_directory_config(directory_config *dcfg)
     /* audit log variables */
     if (dcfg->auditlog_flag == NOT_SET) dcfg->auditlog_flag = 0;
     if (dcfg->auditlog_type == NOT_SET) dcfg->auditlog_type = AUDITLOG_SERIAL;
+    #ifdef WITH_YAJL
+    if (dcfg->auditlog_format == NOT_SET) dcfg->auditlog_format = AUDITLOGFORMAT_NATIVE;
+    #endif
     if (dcfg->max_rule_time == NOT_SET) dcfg->max_rule_time = 0;
     if (dcfg->auditlog_dirperms == NOT_SET) dcfg->auditlog_dirperms = CREATEMODE_DIR;
     if (dcfg->auditlog_fileperms == NOT_SET) dcfg->auditlog_fileperms = CREATEMODE;
@@ -734,6 +765,9 @@ static const char *add_rule(cmd_parms *cmd, directory_config *dcfg, int type,
     char *rid = NULL;
     msre_rule *rule = NULL;
     extern msc_engine *modsecurity;
+    int type_with_lua = 1;
+    int type_rule;
+    int rule_actionset;
     int offset = 0;
 
     #ifdef DEBUG_CONF
@@ -765,26 +799,27 @@ static const char *add_rule(cmd_parms *cmd, directory_config *dcfg, int type,
         return my_error_msg;
     }
 
-    /* Rules must have uniq ID */
-    if (
+#ifndef ALLOW_ID_NOT_UNIQUE
+	/* Rules must have uniq ID */
+    type_rule = (dcfg->tmp_chain_starter == NULL);
 #if defined(WITH_LUA)
-            type != RULE_TYPE_LUA &&
+            type_rule = (type != RULE_TYPE_LUA && type_rule);
 #endif
-            (dcfg->tmp_chain_starter == NULL))
+            if (type_rule)
                 if(rule->actionset == NULL)
                     return "ModSecurity: Rules must have at least id action";
 
     if(rule->actionset != NULL && (dcfg->tmp_chain_starter == NULL))    {
-        if(rule->actionset->id == NOT_SET_P
+        rule_actionset = (rule->actionset->id == NOT_SET_P);
 #if defined(WITH_LUA)
-            && (type != RULE_TYPE_LUA)
+        rule_actionset = (rule_actionset && (type != RULE_TYPE_LUA));
 #endif
-          )
-            return "ModSecurity: No action id present within the rule";
+        if (rule_actionset)
+          return "ModSecurity: No action id present within the rule";
 #if defined(WITH_LUA)
-        if(type != RULE_TYPE_LUA)
+        type_with_lua = (type != RULE_TYPE_LUA);
 #endif
-        {
+        if (type_with_lua){
             rid = apr_hash_get(dcfg->rule_id_htab, rule->actionset->id, APR_HASH_KEY_STRING);
             if(rid != NULL) {
                 return "ModSecurity: Found another rule with the same id";
@@ -797,6 +832,7 @@ static const char *add_rule(cmd_parms *cmd, directory_config *dcfg, int type,
             //    return "ModSecurity: Found another rule with the same id";
         }
     }
+#endif
 
     /* Create default actionset if one does not already exist. */
     if (dcfg->tmp_default_actionset == NULL) {
@@ -852,7 +888,7 @@ static const char *add_rule(cmd_parms *cmd, directory_config *dcfg, int type,
      *
      * ENH Probably do not want this done fully for chained rules.
      */
-    rule->actionset = msre_actionset_merge(modsecurity->msre, dcfg->tmp_default_actionset,
+    rule->actionset = msre_actionset_merge(modsecurity->msre, cmd->pool, dcfg->tmp_default_actionset,
         rule->actionset, 1);
 
     /* Keep track of the parent action for "block" */
@@ -889,11 +925,6 @@ static const char *add_rule(cmd_parms *cmd, directory_config *dcfg, int type,
         if (dcfg->tmp_chain_starter == NULL) {
             dcfg->tmp_chain_starter = rule;
         }
-    }
-
-    /* Optimisation */
-    if ((rule->op_name != NULL)&&(strcasecmp(rule->op_name, "inspectFile") == 0)) {
-        dcfg->upload_validates_files = 1;
     }
 
     /* Create skip table if one does not already exist. */
@@ -1047,7 +1078,7 @@ static const char *update_rule_action(cmd_parms *cmd, directory_config *dcfg,
     }
 
     /* Create a new actionset */
-    new_actionset = msre_actionset_create(modsecurity->msre, p2, &my_error_msg);
+    new_actionset = msre_actionset_create(modsecurity->msre, cmd->pool, p2, &my_error_msg);
     if (new_actionset == NULL) return FATAL_ERROR;
     if (my_error_msg != NULL) return my_error_msg;
 
@@ -1074,7 +1105,7 @@ static const char *update_rule_action(cmd_parms *cmd, directory_config *dcfg,
 
     /* Merge new actions with the rule */
     /* ENH: Will this leak the old actionset? */
-    rule->actionset = msre_actionset_merge(modsecurity->msre, rule->actionset,
+    rule->actionset = msre_actionset_merge(modsecurity->msre, cmd->pool, rule->actionset,
         new_actionset, 1);
     msre_actionset_set_defaults(rule->actionset);
 
@@ -1173,10 +1204,13 @@ static const char *cmd_audit_log(cmd_parms *cmd, void *_dcfg, const char *p1)
     else {
         const char *file_name = ap_server_root_relative(cmd->pool, dcfg->auditlog_name);
         apr_status_t rc;
-
+        
+        if (dcfg->auditlog_fileperms == NOT_SET) {
+            dcfg->auditlog_fileperms = CREATEMODE;
+        }
         rc = apr_file_open(&dcfg->auditlog_fd, file_name,
                 APR_WRITE | APR_APPEND | APR_CREATE | APR_BINARY,
-                CREATEMODE, cmd->pool);
+                dcfg->auditlog_fileperms, cmd->pool);
 
         if (rc != APR_SUCCESS) {
             return apr_psprintf(cmd->pool, "ModSecurity: Failed to open the audit log file: %s",
@@ -1212,9 +1246,12 @@ static const char *cmd_audit_log2(cmd_parms *cmd, void *_dcfg, const char *p1)
         const char *file_name = ap_server_root_relative(cmd->pool, dcfg->auditlog2_name);
         apr_status_t rc;
 
+        if (dcfg->auditlog_fileperms == NOT_SET) {
+            dcfg->auditlog_fileperms = CREATEMODE;
+        }
         rc = apr_file_open(&dcfg->auditlog2_fd, file_name,
                 APR_WRITE | APR_APPEND | APR_CREATE | APR_BINARY,
-                CREATEMODE, cmd->pool);
+                dcfg->auditlog_fileperms, cmd->pool);
 
         if (rc != APR_SUCCESS) {
             return apr_psprintf(cmd->pool, "ModSecurity: Failed to open the secondary audit log file: %s",
@@ -1265,6 +1302,23 @@ static const char *cmd_audit_log_type(cmd_parms *cmd, void *_dcfg,
 
     return NULL;
 }
+
+#ifdef WITH_YAJL
+static const char *cmd_audit_log_mode(cmd_parms *cmd, void *_dcfg,
+        const char *p1)
+{
+    directory_config *dcfg = _dcfg;
+
+    if (strcasecmp(p1, "JSON") == 0) dcfg->auditlog_format = AUDITLOGFORMAT_JSON;
+    else
+        if (strcasecmp(p1, "Native") == 0) dcfg->auditlog_format = AUDITLOGFORMAT_NATIVE;
+        else
+            return (const char *)apr_psprintf(cmd->pool,
+                    "ModSecurity: Unrecognised parameter value for SecAuditLogFormat: %s", p1);
+
+    return NULL;
+}
+#endif
 
 static const char *cmd_audit_log_dirmode(cmd_parms *cmd, void *_dcfg,
         const char *p1)
@@ -1456,7 +1510,7 @@ static const char *cmd_default_action(cmd_parms *cmd, void *_dcfg,
     extern msc_engine *modsecurity;
     char *my_error_msg = NULL;
 
-    dcfg->tmp_default_actionset = msre_actionset_create(modsecurity->msre, p1, &my_error_msg);
+    dcfg->tmp_default_actionset = msre_actionset_create(modsecurity->msre, cmd->pool, p1, &my_error_msg);
     if (dcfg->tmp_default_actionset == NULL) {
         if (my_error_msg != NULL) return my_error_msg;
         else return FATAL_ERROR;
@@ -1649,18 +1703,74 @@ static const char *cmd_rule_perf_time(cmd_parms *cmd, void *_dcfg,
     return NULL;
 }
 
+char *parser_conn_limits_operator(apr_pool_t *mp, const char *p2,
+    TreeRoot **whitelist, TreeRoot **suspicious_list,
+    const char *filename)
+{
+    int res = 0;
+    char *config_orig_path;
+    char *param = strchr(p2, ' ');
+    char *file = NULL;
+    char *error_msg = NULL;
+    param++;
+
+    config_orig_path = apr_pstrndup(mp, filename,
+        strlen(filename) - strlen(apr_filepath_name_get(filename)));
+
+    apr_filepath_merge(&file, config_orig_path, param, APR_FILEPATH_TRUENAME,
+        mp);
+
+    if ((strncasecmp(p2, "!@ipMatchFromFile", strlen("!@ipMatchFromFile")) == 0) ||
+        (strncasecmp(p2, "!@ipMatchF", strlen("!@ipMatchF")) == 0)) {
+
+        res = ip_tree_from_file(whitelist, file, mp, &error_msg);
+    }
+    else if (strncasecmp(p2, "!@ipMatch", strlen("!@ipMatch")) == 0) {
+        res = ip_tree_from_param(mp, param, whitelist, &error_msg);
+    }
+    else if ((strncasecmp(p2, "@ipMatchFromFile", strlen("@ipMatchFromFile")) == 0) ||
+        (strncasecmp(p2, "@ipMatchF", strlen("@ipMatchF")) == 0)) {
+
+        res = ip_tree_from_file(suspicious_list, file, mp, &error_msg);
+    }
+    else if (strncasecmp(p2, "@ipMatch", strlen("@ipMatch")) == 0) {
+        res = ip_tree_from_param(mp, param, suspicious_list, &error_msg);
+    }
+    else {
+        return apr_psprintf(mp, "ModSecurity: Invalid operator for " \
+           "SecConnReadStateLimit: %s, expected operators: @ipMatch, @ipMatchF " \
+           "or @ipMatchFromFile with or without !", p2);
+    }
+
+    if (res) {
+        char *error;
+        error = apr_psprintf(mp, "ModSecurity: failed to load IPs " \
+            "from: %s", param);
+
+        if (*error_msg) {
+            error = apr_psprintf(mp, "%s %s", error, error_msg);
+        }
+
+        return error;
+    }
+
+    return NULL;
+}
+
+
 /**
-* \brief Add SecReadStateLimit configuration option
+* \brief Add SecConnReadStateLimit configuration option
 *
 * \param cmd Pointer to configuration data
 * \param _dcfg Pointer to directory configuration
 * \param p1 Pointer to configuration option
+* \param p2 Pointer to configuration option
 *
 * \retval NULL On failure
 * \retval apr_psprintf On Success
 */
 static const char *cmd_conn_read_state_limit(cmd_parms *cmd, void *_dcfg,
-        const char *p1)
+        const char *p1, const char *p2)
 {
     directory_config *dcfg = (directory_config *)_dcfg;
     long int limit;
@@ -1668,8 +1778,18 @@ static const char *cmd_conn_read_state_limit(cmd_parms *cmd, void *_dcfg,
     if (dcfg == NULL) return NULL;
 
     limit = strtol(p1, NULL, 10);
-    if ((limit == LONG_MAX)||(limit == LONG_MIN)||(limit <= 0)) {
-        return apr_psprintf(cmd->pool, "ModSecurity: Invalid value for SecReadStateLimit: %s", p1);
+    if ((limit == LONG_MAX) || (limit == LONG_MIN) || (limit <= 0)) {
+        return apr_psprintf(cmd->pool, "ModSecurity: Invalid value for " \
+            "SecConnReadStateLimit: %s", p1);
+    }
+
+    if (p2 != NULL) {
+        char *param = parser_conn_limits_operator(cmd->pool, p2,
+            &conn_read_state_whitelist, &conn_read_state_suspicious_list,
+            cmd->directive->filename);
+
+        if (param)
+            return param;
     }
 
     conn_read_state_limit = limit;
@@ -1677,18 +1797,29 @@ static const char *cmd_conn_read_state_limit(cmd_parms *cmd, void *_dcfg,
     return NULL;
 }
 
+static const char *cmd_read_state_limit(cmd_parms *cmd, void *_dcfg,
+        const char *p1, const char *p2)
+{
+    ap_log_perror(APLOG_MARK, APLOG_STARTUP|APLOG_NOERRNO, 0, cmd->pool,
+            "SecReadStateLimit is depricated, use SecConnReadStateLimit " \
+            "instead.");
+
+    return cmd_conn_read_state_limit(cmd, _dcfg, p1, p2);
+}
+
 /**
-* \brief Add SecWriteStateLimit configuration option
+* \brief Add SecConnWriteStateLimit configuration option
 *
 * \param cmd Pointer to configuration data
 * \param _dcfg Pointer to directory configuration
 * \param p1 Pointer to configuration option
+* \param p2 Pointer to configuration option
 *
 * \retval NULL On failure
 * \retval apr_psprintf On Success
 */
 static const char *cmd_conn_write_state_limit(cmd_parms *cmd, void *_dcfg,
-        const char *p1)
+        const char *p1, const char *p2)
 {
     directory_config *dcfg = (directory_config *)_dcfg;
     long int limit;
@@ -1696,14 +1827,34 @@ static const char *cmd_conn_write_state_limit(cmd_parms *cmd, void *_dcfg,
     if (dcfg == NULL) return NULL;
 
     limit = strtol(p1, NULL, 10);
-    if ((limit == LONG_MAX)||(limit == LONG_MIN)||(limit <= 0)) {
-        return apr_psprintf(cmd->pool, "ModSecurity: Invalid value for SecWriteStateLimit: %s", p1);
+    if ((limit == LONG_MAX) || (limit == LONG_MIN) || (limit <= 0)) {
+        return apr_psprintf(cmd->pool, "ModSecurity: Invalid value for " \
+            "SecConnWriteStateLimit: %s", p1);
+    }
+
+    if (p2 != NULL) {
+        char *param = parser_conn_limits_operator(cmd->pool, p2,
+            &conn_write_state_whitelist, &conn_write_state_suspicious_list,
+            cmd->directive->filename);
+
+        if (param)
+            return param;
     }
 
     conn_write_state_limit = limit;
 
     return NULL;
 }
+static const char *cmd_write_state_limit(cmd_parms *cmd, void *_dcfg,
+        const char *p1, const char *p2)
+{
+    ap_log_perror(APLOG_MARK, APLOG_STARTUP|APLOG_NOERRNO, 0, cmd->pool,
+            "SecWriteStateLimit is depricated, use SecConnWriteStateLimit " \
+            "instead.");
+
+    return cmd_conn_write_state_limit(cmd, _dcfg, p1, p2);
+}
+
 
 
 static const char *cmd_request_body_inmemory_limit(cmd_parms *cmd, void *_dcfg,
@@ -2043,24 +2194,173 @@ static const char *cmd_rule(cmd_parms *cmd, void *_dcfg,
     return add_rule(cmd, (directory_config *)_dcfg, RULE_TYPE_NORMAL, p1, p2, p3);
 }
 
-static const char *cmd_rule_engine(cmd_parms *cmd, void *_dcfg, const char *p1)
+static const char *cmd_sever_conn_filters_engine(cmd_parms *cmd, void *_dcfg,
+    const char *p1)
 {
     directory_config *dcfg = (directory_config *)_dcfg;
+
     if (dcfg == NULL) return NULL;
 
-    if (strcasecmp(p1, "on") == 0) dcfg->is_enabled = MODSEC_ENABLED;
+    if (strcasecmp(p1, "on") == 0)
+    {
+        conn_limits_filter_state = MODSEC_ENABLED;
+    }
+    else if (strcasecmp(p1, "off") == 0)
+    {
+        conn_limits_filter_state = MODSEC_DISABLED;
+    }
+    else if (strcasecmp(p1, "detectiononly") == 0)
+    {
+        conn_limits_filter_state = MODSEC_DETECTION_ONLY;
+    }
     else
-    if (strcasecmp(p1, "off") == 0) dcfg->is_enabled = MODSEC_DISABLED;
-    else
-    if (strcasecmp(p1, "detectiononly") == 0) {
-        dcfg->is_enabled = MODSEC_DETECTION_ONLY;
-        dcfg->of_limit_action = RESPONSE_BODY_LIMIT_ACTION_PARTIAL;
-        dcfg->if_limit_action = REQUEST_BODY_LIMIT_ACTION_PARTIAL;
-    } else
-    return apr_psprintf(cmd->pool, "ModSecurity: Invalid value for SecRuleEngine: %s", p1);
+    {
+        return apr_psprintf(cmd->pool, "ModSecurity: Invalid value for " \
+                "SecConnEngine: %s", p1);
+    }
 
     return NULL;
 }
+
+static const char *cmd_rule_engine(cmd_parms *cmd, void *_dcfg, const char *p1)
+{
+    directory_config *dcfg = (directory_config *)_dcfg;
+
+    if (dcfg == NULL) return NULL;
+
+    if (strcasecmp(p1, "on") == 0)
+    {
+        dcfg->is_enabled = MODSEC_ENABLED;
+    }
+    else if (strcasecmp(p1, "off") == 0)
+    {
+        dcfg->is_enabled = MODSEC_DISABLED;
+    }
+    else if (strcasecmp(p1, "detectiononly") == 0)
+    {
+        dcfg->is_enabled = MODSEC_DETECTION_ONLY;
+        dcfg->of_limit_action = RESPONSE_BODY_LIMIT_ACTION_PARTIAL;
+        dcfg->if_limit_action = REQUEST_BODY_LIMIT_ACTION_PARTIAL;
+    }
+    else
+    {
+        return apr_psprintf(cmd->pool, "ModSecurity: Invalid value for " \
+                "SecRuleEngine: %s", p1);
+    }
+
+    return NULL;
+}
+
+static const char *cmd_remote_rules_fail(cmd_parms *cmd, void *_dcfg, const char *p1)
+{
+    directory_config *dcfg = (directory_config *)_dcfg;
+    if (dcfg == NULL) return NULL;
+    if (strncasecmp(p1, "warn", 4) == 0)
+    {
+        remote_rules_fail_action = REMOTE_RULES_WARN_ON_FAIL;
+    }
+    else if (strncasecmp(p1, "abort", 5) == 0)
+    {
+        remote_rules_fail_action = REMOTE_RULES_ABORT_ON_FAIL;
+    }
+    else
+    {
+        return apr_psprintf(cmd->pool, "ModSecurity: Invalid value for " \
+                "SecRemoteRulesFailAction, expected: Abort or Warn.");
+    }
+
+    return NULL;
+}
+
+static const char *cmd_remote_rules(cmd_parms *cmd, void *_dcfg, const char *p1,
+        const char *p2, const char *p3)
+{
+    char *error_msg = NULL;
+    directory_config *dcfg = (directory_config *)_dcfg;
+#ifdef WITH_REMOTE_RULES
+    int crypto = 0;
+    const char *uri = p2;
+    const char *key = p1;
+#endif
+
+    if (dcfg == NULL) return NULL;
+
+#ifdef WITH_REMOTE_RULES
+    if (strncasecmp(p1, "crypto", 6) == 0)
+    {
+#ifdef WITH_APU_CRYPTO
+        uri = p3;
+        key = p2;
+        crypto = 1;
+#else
+        return apr_psprintf(cmd->pool, "ModSecurity: SecRemoteRule using " \
+                "`crypto' but ModSecurity was not compiled with crypto " \
+                "support.");
+#endif
+    }
+
+    if (uri == NULL || key == NULL)
+    {
+        return apr_psprintf(cmd->pool, "ModSecurity: Use SecRemoteRule with " \
+                "Key and URI");
+    }
+
+    if (strncasecmp(uri, "https", 5) != 0) {
+        return apr_psprintf(cmd->pool, "ModSecurity: Invalid URI:" \
+                " '%s'. Expected HTTPS.", uri);
+    }
+
+    // FIXME: Should we handle more then one server at once?
+    if (remote_rules_server != NULL)
+    {
+        return apr_psprintf(cmd->pool, "ModSecurity: " \
+                "SecRemoteRules cannot be used more than once.");
+    }
+
+    remote_rules_server = apr_pcalloc(cmd->pool, sizeof(msc_remote_rules_server));
+    if (remote_rules_server == NULL)
+    {
+        return apr_psprintf(cmd->pool, "ModSecurity: " \
+                "SecRemoteRules: Internal failure. Not enougth memory.");
+    }
+
+    remote_rules_server->context = dcfg;
+    remote_rules_server->context_label = apr_pstrdup(cmd->pool, "Unkwon context");
+    remote_rules_server->key = key;
+    remote_rules_server->uri = uri;
+    remote_rules_server->amount_of_rules = 0;
+    remote_rules_server->crypto = crypto;
+
+    msc_remote_add_rules_from_uri(cmd, remote_rules_server, &error_msg);
+    if (error_msg != NULL)
+    {
+        return error_msg;
+    }
+#else
+    return apr_psprintf(cmd->pool, "ModSecurity: SecRemoteRules: " \
+            "ModSecurity was not compiled with SecRemoteRules support.");
+#endif
+
+    return NULL;
+}
+
+
+static const char *cmd_status_engine(cmd_parms *cmd, void *_dcfg, const char *p1)
+{
+    if (strcasecmp(p1, "on") == 0) {
+        status_engine_state = STATUS_ENGINE_ENABLED;
+    }
+    else if (strcasecmp(p1, "off") == 0) {
+        status_engine_state = STATUS_ENGINE_DISABLED;
+    }
+    else {
+        return apr_psprintf(cmd->pool, "ModSecurity: Invalid value for " \
+                "SecStatusEngine: %s", p1);
+    }
+
+    return NULL;
+}
+
 
 static const char *cmd_rule_inheritance(cmd_parms *cmd, void *_dcfg, int flag)
 {
@@ -2276,6 +2576,30 @@ static const char *cmd_upload_keep_files(cmd_parms *cmd, void *_dcfg,
     return NULL;
 }
 
+static const char *cmd_upload_save_tmp_files(cmd_parms *cmd, void *_dcfg,
+    const char *p1)
+{
+    directory_config *dcfg = (directory_config *)_dcfg;
+
+    if (dcfg == NULL) return NULL;
+
+    if (strcasecmp(p1, "on") == 0)
+    {
+        dcfg->upload_validates_files = 1;
+    }
+    else if (strcasecmp(p1, "off") == 0)
+    {
+        dcfg->upload_validates_files = 0;
+    }
+    else
+    {
+        return apr_psprintf(cmd->pool, "ModSecurity: Invalid setting for SecTmpSaveUploadedFiles: %s",
+            p1);
+    }
+
+    return NULL;
+}
+
 static const char *cmd_web_app_id(cmd_parms *cmd, void *_dcfg, const char *p1)
 {
     directory_config *dcfg = (directory_config *)_dcfg;
@@ -2346,7 +2670,7 @@ static const char *cmd_hash_engine(cmd_parms *cmd, void *_dcfg, const char *p1)
         dcfg->hash_is_enabled = HASH_DISABLED;
         dcfg->hash_enforcement = HASH_DISABLED;
     }
-    else return apr_psprintf(cmd->pool, "ModSecurity: Invalid value for SexHashEngine: %s", p1);
+    else return apr_psprintf(cmd->pool, "ModSecurity: Invalid value for SecHashEngine: %s", p1);
 
     return NULL;
 }
@@ -2656,6 +2980,8 @@ static const char *cmd_geo_lookup_db(cmd_parms *cmd, void *_dcfg,
 /**
 * \brief Add SecUnicodeCodePage configuration option
 *
+* Depcrecated
+*
 * \param cmd Pointer to configuration data
 * \param _dcfg Pointer to directory configuration
 * \param p1 Pointer to configuration option
@@ -2688,12 +3014,23 @@ static const char *cmd_unicode_codepage(cmd_parms *cmd,
 * \retval NULL On success
 */
 static const char *cmd_unicode_map(cmd_parms *cmd, void *_dcfg,
-                                     const char *p1)
+                                     const char *p1, const char *p2)
 {
     const char *filename = resolve_relative_path(cmd->pool, cmd->directive->filename, p1);
     char *error_msg;
+    long val = 0;
     directory_config *dcfg = (directory_config *)_dcfg;
     if (dcfg == NULL) return NULL;
+
+    if(p2 != NULL)  {
+        val = atol(p2);
+        if (val <= 0) {
+            return apr_psprintf(cmd->pool, "ModSecurity: Invalid setting for "
+                    "SecUnicodeMapFile: %s", p2);
+        }
+
+        unicode_codepage = (unsigned long int)val;
+    }
 
     if (unicode_map_init(dcfg, filename, &error_msg) <= 0) {
         return error_msg;
@@ -2924,6 +3261,16 @@ const command_rec module_directives[] = {
         "whether to use the old audit log format (Serial) or new (Concurrent)"
     ),
 
+#ifdef WITH_YAJL
+    AP_INIT_TAKE1 (
+        "SecAuditLogFormat",
+        cmd_audit_log_mode,
+        NULL,
+        CMD_SCOPE_ANY,
+        "whether to emit audit log data in native format or JSON"
+    ),
+#endif
+
     AP_INIT_TAKE1 (
         "SecAuditLogStorageDir",
         cmd_audit_log_storage_dir,
@@ -3069,7 +3416,7 @@ const command_rec module_directives[] = {
         "Unicode CodePage"
     ),
 
-    AP_INIT_TAKE1 (
+    AP_INIT_TAKE12 (
         "SecUnicodeMapFile",
         cmd_unicode_map,
         NULL,
@@ -3141,17 +3488,33 @@ const command_rec module_directives[] = {
         "Threshold to log slow rules in usecs."
     ),
 
-    AP_INIT_TAKE1 (
-        "SecReadStateLimit",
+    AP_INIT_TAKE12 (
+        "SecConnReadStateLimit",
         cmd_conn_read_state_limit,
         NULL,
         CMD_SCOPE_ANY,
         "maximum number of threads in READ_BUSY state per ip address"
     ),
 
-    AP_INIT_TAKE1 (
-        "SecWriteStateLimit",
+    AP_INIT_TAKE12 (
+        "SecReadStateLimit",
+        cmd_read_state_limit,
+        NULL,
+        CMD_SCOPE_ANY,
+        "maximum number of threads in READ_BUSY state per ip address"
+    ),
+
+    AP_INIT_TAKE12 (
+        "SecConnWriteStateLimit",
         cmd_conn_write_state_limit,
+        NULL,
+        CMD_SCOPE_ANY,
+        "maximum number of threads in WRITE_BUSY state per ip address"
+    ),
+
+    AP_INIT_TAKE12 (
+        "SecWriteStateLimit",
+        cmd_write_state_limit,
         NULL,
         CMD_SCOPE_ANY,
         "maximum number of threads in WRITE_BUSY state per ip address"
@@ -3262,6 +3625,39 @@ const command_rec module_directives[] = {
         CMD_SCOPE_ANY,
         "On or Off"
     ),
+
+    AP_INIT_TAKE1 (
+        "SecStatusEngine",
+        cmd_status_engine,
+        NULL,
+        CMD_SCOPE_ANY,
+        "On or Off"
+    ),
+
+    AP_INIT_TAKE1 (
+        "SecConnEngine",
+        cmd_sever_conn_filters_engine,
+        NULL,
+        CMD_SCOPE_ANY,
+        "On or Off"
+    ),
+
+    AP_INIT_TAKE23 (
+        "SecRemoteRules",
+        cmd_remote_rules,
+        NULL,
+        CMD_SCOPE_ANY,
+        "key and URI to the remote rules"
+    ),
+
+    AP_INIT_TAKE1 (
+        "SecRemoteRulesFailAction",
+        cmd_remote_rules_fail,
+        NULL,
+        CMD_SCOPE_ANY,
+        "Abort or Warn"
+    ),
+
 
     AP_INIT_TAKE1 (
         "SecXmlExternalEntity",
@@ -3462,6 +3858,14 @@ const command_rec module_directives[] = {
     AP_INIT_TAKE1 (
         "SecUploadKeepFiles",
         cmd_upload_keep_files,
+        NULL,
+        CMD_SCOPE_ANY,
+        "On or Off"
+    ),
+
+    AP_INIT_TAKE1 (
+        "SecTmpSaveUploadedFiles",
+        cmd_upload_save_tmp_files,
         NULL,
         CMD_SCOPE_ANY,
         "On or Off"

@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -511,6 +511,19 @@ static int var_reqbody_processor_generate(modsec_rec *msr, msre_var *var, msre_r
     return 1;
 }
 
+/* SDBM_DELETE_ERROR */
+static int var_sdbm_delete_error_generate(modsec_rec *msr, msre_var *var, msre_rule *rule,
+    apr_table_t *vartab, apr_pool_t *mptmp)
+{
+    msre_var *rvar = apr_pmemdup(mptmp, var, sizeof(msre_var));
+
+    rvar->value = apr_psprintf(mptmp, "%d", msr->msc_sdbm_delete_error);
+    rvar->value_len = strlen(rvar->value);
+    apr_table_addn(vartab, rvar->name, (void *)rvar);
+
+    return 1;
+}
+
 /* REQBODY_ERROR */
 
 static int var_reqbody_processor_error_generate(modsec_rec *msr, msre_var *var, msre_rule *rule,
@@ -700,13 +713,22 @@ static int var_useragent_ip_generate(modsec_rec *msr, msre_var *var, msre_rule *
 static int var_remote_addr_generate(modsec_rec *msr, msre_var *var, msre_rule *rule,
     apr_table_t *vartab, apr_pool_t *mptmp)
 {
+#if !defined(MSC_TEST)
+#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 3
+    if (ap_find_linked_module("mod_remoteip.c") != NULL) {
+        if(msr->r->useragent_ip != NULL) msr->remote_addr = apr_pstrdup(msr->mp, msr->r->useragent_ip);
+        return var_simple_generate(var, vartab, mptmp, msr->remote_addr);
+    }
+#endif
+#endif
+
     return var_simple_generate(var, vartab, mptmp, msr->remote_addr);
 }
 
 /* REMOTE_HOST */
 
 static int var_remote_host_generate(modsec_rec *msr, msre_var *var, msre_rule *rule,
-    apr_table_t *vartab, apr_pool_t *mptmp)
+        apr_table_t *vartab, apr_pool_t *mptmp)
 {
     const char *value1 = ap_get_remote_host(msr->r->connection, msr->r->per_dir_config,
         REMOTE_NAME, NULL);
@@ -1090,6 +1112,97 @@ static int var_resource_generate(modsec_rec *msr, msre_var *var, msre_rule *rule
 
     return count;
 }
+
+/* FILES_TMP_CONTENT */
+
+static int var_files_tmp_contents_generate(modsec_rec *msr, msre_var *var,
+    msre_rule *rule, apr_table_t *vartab, apr_pool_t *mptmp)
+{
+    multipart_part **parts = NULL;
+    int i, count = 0;
+
+    if (msr->mpd == NULL) return 0;
+
+    parts = (multipart_part **)msr->mpd->parts->elts;
+    for (i = 0; i < msr->mpd->parts->nelts; i++)
+    {
+        if ((parts[i]->type == MULTIPART_FILE) &&
+                (parts[i]->tmp_file_name != NULL))
+        {
+            int match = 0;
+
+            /* Figure out if we want to include this variable. */
+            if (var->param == NULL)
+            {
+                match = 1;
+            }
+            else
+            {
+                if (var->param_data != NULL)
+                {
+                    /* Regex. */
+                    char *my_error_msg = NULL;
+                    if (!(msc_regexec((msc_regex_t *)var->param_data,
+                        parts[i]->name, strlen(parts[i]->name),
+                        &my_error_msg) == PCRE_ERROR_NOMATCH)) 
+                    {
+                        match = 1;
+                    }
+                }
+                else
+                {
+                    /* Simple comparison. */
+                    if (strcasecmp(parts[i]->name, var->param) == 0)
+                    {
+                        match = 1;
+                    }
+                }
+            }
+            /* If we had a match add this argument to the collection. */
+            if (match) {
+                char buf[1024];
+                FILE *file;
+                size_t nread;
+                char *full_content = NULL;
+                size_t total_lenght = 0;
+                msre_var *rvar = NULL;
+
+                file = fopen(parts[i]->tmp_file_name, "r");
+                if (file == NULL)
+                {
+                    continue;
+                }
+
+                while ((nread = fread(buf, 1, 1023, file)) > 0)
+                {   
+                    total_lenght += nread;
+                    buf[nread] = '\0';
+                    if (full_content == NULL)
+                    {
+                        full_content = apr_psprintf(mptmp, "%s", buf);
+                    }
+                    else
+                    {
+                        full_content = apr_psprintf(mptmp, "%s%s", full_content, buf);
+                    }
+                }
+                fclose(file);
+
+                rvar = apr_pmemdup(mptmp, var, sizeof(msre_var));
+                rvar->value = full_content;
+                rvar->value_len = total_lenght;
+                rvar->name = apr_psprintf(mptmp, "FILES_TMP_CONTENT:%s",
+                    log_escape_nq(mptmp, parts[i]->name));
+                apr_table_addn(vartab, rvar->name, (void *)rvar);
+
+                count++;
+            }
+        }
+    }
+
+    return count;
+}
+
 
 /* FILES_TMPNAMES */
 
@@ -1715,7 +1828,7 @@ static int var_duration_generate(modsec_rec *msr, msre_var *var, msre_rule *rule
 
     rvar = apr_pmemdup(mptmp, var, sizeof(msre_var));
     rvar->value = apr_psprintf(mptmp, "%" APR_TIME_T_FMT,
-        (apr_time_usec(apr_time_now() - msr->r->request_time)));
+        (apr_time_now() - msr->r->request_time));
     rvar->value_len = strlen(rvar->value);
     apr_table_addn(vartab, rvar->name, (void *)rvar);
 
@@ -1912,6 +2025,86 @@ static int var_request_basename_generate(modsec_rec *msr, msre_var *var, msre_ru
     return var_simple_generate(var, vartab, mptmp, value);
 }
 
+/* FULL_REQUEST */
+
+static int var_full_request_generate(modsec_rec *msr, msre_var *var,
+        msre_rule *rule, apr_table_t *vartab, apr_pool_t *mptmp)
+{
+    const apr_array_header_t *arr = NULL;
+    char *full_request = NULL;
+    int full_request_length = 0;
+    int headers_length = 0;
+    int request_line_length = 0;
+
+    arr = apr_table_elts(msr->request_headers);
+    headers_length = msc_headers_to_buffer(arr, NULL, 0);
+    if (headers_length < 0) {
+        msr_log(msr, 9, "Variable FULL_REQUEST failed. Problems to measure " \
+                "headers length.");
+        goto failed_measure_buffer;
+    }
+
+    request_line_length = strlen(msr->request_line) + /* \n\n: */ 2;
+    full_request_length = request_line_length + headers_length +
+        msr->msc_reqbody_length + /* \0: */1;
+
+    full_request = malloc(sizeof(char)*full_request_length);
+    if (full_request == NULL) {
+        if (msr->txcfg->debuglog_level >= 9) {
+            msr_log(msr, 8, "Variable FULL_REQUEST will not be created, not " \
+                    "enough memory available.");
+        }
+        goto failed_not_enough_mem;
+    }
+    memset(full_request, '\0', sizeof(char)*msr->msc_full_request_length);
+    msr->msc_full_request_buffer = full_request;
+    msr->msc_full_request_length = full_request_length;
+
+    apr_snprintf(full_request, request_line_length + 1,
+            /* +1 here because sprintf will place \0 in the end of the string.*/
+            "%s\n\n", msr->request_line);
+
+    headers_length = msc_headers_to_buffer(arr, full_request +
+            request_line_length, headers_length);
+    if (headers_length < 0) {
+        msr_log(msr, 9, "Variable FULL_REQUEST will not be created, failed " \
+                "to fill headers buffer.");
+        goto failed_fill_buffer;
+    }
+
+    if (msr->msc_reqbody_length > 0 && msr->msc_reqbody_buffer != NULL) {
+        memcpy(full_request + (headers_length + request_line_length),
+                msr->msc_reqbody_buffer, msr->msc_reqbody_length);
+    }
+    full_request[msr->msc_full_request_length-1] = '\0';
+
+    return var_simple_generate_ex(var, vartab, mptmp, full_request,
+            msr->msc_full_request_length);
+
+failed_fill_buffer:
+failed_not_enough_mem:
+failed_measure_buffer:
+    return 0;
+}
+
+/* FULL_REQUEST_LENGTH */
+
+static int var_full_request_length_generate(modsec_rec *msr, msre_var *var, msre_rule *rule,
+    apr_table_t *vartab, apr_pool_t *mptmp)
+{
+    const apr_array_header_t *arr = NULL;
+    char *value = NULL;
+    int headers_length = 0;
+
+    arr = apr_table_elts(msr->request_headers);
+    headers_length = msc_headers_to_buffer(arr, NULL, 0);
+    msr->msc_full_request_length = headers_length + msr->msc_reqbody_length + /* \0: */1;
+
+    value = apr_psprintf(mptmp, "%d", msr->msc_full_request_length);
+    return var_simple_generate(var, vartab, mptmp, value);
+}
+
+
 /* REQUEST_BODY */
 
 static int var_request_body_generate(modsec_rec *msr, msre_var *var, msre_rule *rule,
@@ -1964,6 +2157,11 @@ static int var_matched_vars_names_generate(modsec_rec *msr, msre_var *var, msre_
         if (match && (strncmp(str->name,"MATCHED_VARS:",13) != 0) && (strncmp(str->name,"MATCHED_VARS_NAMES:",19))) {
 
             msre_var *rvar = apr_palloc(mptmp, sizeof(msre_var));
+
+            rvar->param = NULL;
+            rvar->param_data = NULL;
+            rvar->metadata = NULL;
+            rvar->param_regex = NULL;
 
             rvar->value = apr_pstrndup(mptmp, str->name, strlen(str->name));
             rvar->value_len = strlen(rvar->value);
@@ -2024,6 +2222,11 @@ static int var_matched_vars_generate(modsec_rec *msr, msre_var *var, msre_rule *
         if (match && (strncmp(str->name,"MATCHED_VARS:",13) != 0) && (strncmp(str->name,"MATCHED_VARS_NAMES:",19))) {
 
             msre_var *rvar = apr_palloc(mptmp, sizeof(msre_var));
+
+            rvar->param = NULL;
+            rvar->param_data = NULL;
+            rvar->metadata = NULL;
+            rvar->param_regex = NULL;
 
             rvar->value = apr_pstrndup(mptmp, str->value, str->value_len);
             rvar->value_len = str->value_len;
@@ -2752,6 +2955,17 @@ void msre_engine_register_default_variables(msre_engine *engine) {
         PHASE_REQUEST_BODY
     );
 
+    /* FILES_TMP_CONTENT */
+    msre_engine_variable_register(engine,
+        "FILES_TMP_CONTENT",
+        VAR_LIST,
+        0, 1,
+        var_generic_list_validate,
+        var_files_tmp_contents_generate,
+        VAR_CACHE,
+        PHASE_REQUEST_BODY
+    );
+
     /* GEO */
     msre_engine_variable_register(engine,
         "GEO",
@@ -3117,6 +3331,16 @@ void msre_engine_register_default_variables(msre_engine *engine) {
         PHASE_REQUEST_HEADERS
     );
 
+    msre_engine_variable_register(engine,
+        "SDBM_DELETE_ERROR",
+        VAR_SIMPLE,
+        0, 0,
+        NULL,
+        var_sdbm_delete_error_generate,
+        VAR_DONT_CACHE, /* dynamic */
+        PHASE_REQUEST_BODY
+    );
+
     /* REQBODY_PROCESSOR_ERROR - Deprecated */
     msre_engine_variable_register(engine,
         "REQBODY_PROCESSOR_ERROR",
@@ -3172,12 +3396,35 @@ void msre_engine_register_default_variables(msre_engine *engine) {
         PHASE_REQUEST_HEADERS
     );
 
-    /* REQUEST_BODY */
+    /* FULL_REQUEST */
     msre_engine_variable_register(engine,
-        "REQUEST_BODY",
+        "FULL_REQUEST",
         VAR_SIMPLE,
         0, 0,
         NULL,
+        var_full_request_generate,
+        VAR_CACHE,
+        PHASE_REQUEST_BODY
+    );
+
+    /* FULL_REQUEST_LENGTH */
+    msre_engine_variable_register(engine,
+        "FULL_REQUEST_LENGTH",
+        VAR_SIMPLE,
+        0, 0,
+        NULL,
+        var_full_request_length_generate,
+        VAR_CACHE,
+        PHASE_REQUEST_BODY
+    );
+
+
+    /* REQUEST_BODY */
+    msre_engine_variable_register(engine,
+        "REQUEST_BODY",
+        VAR_LIST,
+        0, 1,
+        var_generic_list_validate,
         var_request_body_generate,
         VAR_CACHE,
         PHASE_REQUEST_BODY

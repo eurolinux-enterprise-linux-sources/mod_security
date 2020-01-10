@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -25,6 +25,12 @@
 #include "apr_optional.h"
 #include "mod_log_config.h"
 
+/*
+ * #ifdef APLOG_USE_MODULE
+ * APLOG_USE_MODULE(security2);
+ * #endif
+ */
+
 #include "msc_logging.h"
 #include "msc_util.h"
 
@@ -33,10 +39,18 @@
 
 #include "apr_version.h"
 
+#include "msc_remote_rules.h"
+
 #if defined(WITH_LUA)
 #include "msc_lua.h"
 #endif
 
+#include "msc_status_engine.h"
+
+
+#ifdef WITH_YAJL
+#include <yajl/yajl_version.h>
+#endif /* WITH_YAJL */
 
 /* ModSecurity structure */
 
@@ -48,7 +62,7 @@ char DSOLOCAL *chroot_dir = NULL;
 
 char DSOLOCAL *new_server_signature = NULL;
 
-static char *real_server_signature = NULL;
+char DSOLOCAL *real_server_signature = NULL;
 
 char DSOLOCAL *guardianlog_name = NULL;
 
@@ -60,19 +74,29 @@ unsigned long int DSOLOCAL msc_pcre_match_limit = 0;
 
 unsigned long int DSOLOCAL msc_pcre_match_limit_recursion = 0;
 
+#ifdef WITH_REMOTE_RULES
+msc_remote_rules_server DSOLOCAL *remote_rules_server = NULL;
+#endif
+int DSOLOCAL remote_rules_fail_action = REMOTE_RULES_ABORT_ON_FAIL;
+char DSOLOCAL *remote_rules_fail_message = NULL;
+
+int DSOLOCAL status_engine_state = STATUS_ENGINE_DISABLED;
+
+int DSOLOCAL conn_limits_filter_state = MODSEC_DISABLED;
+
 unsigned long int DSOLOCAL conn_read_state_limit = 0;
+TreeRoot DSOLOCAL *conn_read_state_whitelist = 0;
+TreeRoot DSOLOCAL *conn_read_state_suspicious_list = 0;
 
 unsigned long int DSOLOCAL conn_write_state_limit = 0;
+TreeRoot DSOLOCAL *conn_write_state_whitelist = 0;
+TreeRoot DSOLOCAL *conn_write_state_suspicious_list = 0;
+
 
 #if defined(WIN32) || defined(VERSION_NGINX)
 int (*modsecDropAction)(request_rec *r) = NULL;
 #endif
 static int server_limit, thread_limit;
-
-typedef struct {
-    int child_num;
-    int thread_num;
-} sb_handle;
 
 /* -- Miscellaneous functions -- */
 
@@ -88,7 +112,7 @@ static void version(apr_pool_t *mp) {
             "ModSecurity: APR compiled version=\"%s\"; "
             "loaded version=\"%s\"", APR_VERSION_STRING, apr_version_string());
 
-    if (strstr(apr_version_string(),APR_VERSION_STRING) == NULL)    {
+    if (strstr(apr_version_string(), APR_VERSION_STRING) == NULL)    {
         ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, "ModSecurity: Loaded APR do not match with compiled!");
     }
 
@@ -105,11 +129,16 @@ static void version(apr_pool_t *mp) {
     /* Lua version function was removed in current 5.1. Need to check in future versions if it's back */
 #if defined(WITH_LUA)
     ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, NULL,
-            "ModSecurity: LUA compiled version=\"%s\"",LUA_VERSION);
+            "ModSecurity: LUA compiled version=\"%s\"", LUA_VERSION);
 #endif /* WITH_LUA */
 
+#ifdef WITH_YAJL
     ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, NULL,
-            "ModSecurity: LIBXML compiled version=\"%s\"",LIBXML_DOTTED_VERSION);
+            "ModSecurity: YAJL compiled version=\"%d.%d.%d\"", YAJL_MAJOR, YAJL_MINOR, YAJL_MICRO);
+#endif /* WITH_YAJL */
+
+    ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, NULL,
+            "ModSecurity: LIBXML compiled version=\"%s\"", LIBXML_DOTTED_VERSION);
 }
 
 
@@ -195,6 +224,7 @@ int perform_interception(modsec_rec *msr) {
             break;
 
         case ACTION_PROXY :
+#if !(defined(VERSION_IIS)) && !(defined(VERSION_NGINX)) && !(defined(VERSION_STANDALONE))
             if (msr->phase < 3) {
                 if (ap_find_linked_module("mod_proxy.c") == NULL) {
                     log_level = 1;
@@ -219,6 +249,15 @@ int perform_interception(modsec_rec *msr) {
                     "(Configuration Error: Proxy action requested but it does not work in output phases).",
                     phase_text);
             }
+#else
+            log_level = 1;
+            status = HTTP_INTERNAL_SERVER_ERROR;
+            message = apr_psprintf(msr->mp, "Access denied with code 500%s "
+                "(Configuration Error: Proxy action to %s requested but "
+                "proxy is only available in Apache version).",
+                phase_text,
+                log_escape_nq(msr->mp, actionset->intercept_uri));
+#endif
             break;
 
         case ACTION_DROP :
@@ -228,9 +267,22 @@ int perform_interception(modsec_rec *msr) {
             #if !defined(WIN32) && !defined(VERSION_NGINX)
             {
                 extern module core_module;
-                apr_socket_t *csd = ap_get_module_config(msr->r->connection->conn_config,
-                    &core_module);
+                apr_socket_t *csd;
 
+#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2 && AP_SERVER_PATCHLEVEL_NUMBER > 17
+                /* For mod_http2 used by HTTP/2 there is a virtual connection so must go through
+                 * master to get the main connection or the drop request doesn't seem to do anything.
+                 * For HTTP/1.1 master will not be defined so just go through normal connection.
+                 * More details here: https://github.com/icing/mod_h2/issues/127
+                 */
+                if (msr->r->connection->master) {
+                    csd = ap_get_module_config(msr->r->connection->master->conn_config, &core_module);
+                } else {
+                    csd = ap_get_module_config(msr->r->connection->conn_config, &core_module);
+                }
+#else
+		csd = ap_get_module_config(msr->r->connection->conn_config, &core_module);
+#endif
                 if (csd) {
                     if (apr_socket_close(csd) == APR_SUCCESS) {
                         status = HTTP_FORBIDDEN;
@@ -509,6 +561,8 @@ static modsec_rec *create_tx_context(request_rec *r) {
     msr->request_headers = apr_table_copy(msr->mp, r->headers_in);
     msr->hostname = ap_get_server_name(r);
 
+    msr->msc_full_request_buffer = NULL;
+    msr->msc_full_request_length = 0;
     msr->msc_rule_mptmp = NULL;
 
     /* Invoke the engine to continue with initialisation */
@@ -537,6 +591,11 @@ static modsec_rec *create_tx_context(request_rec *r) {
 static apr_status_t change_server_signature(server_rec *s) {
     char *server_version = NULL;
 
+    /* This is a very particular way to handle the server banner. It is Apache
+     * only. Stanalone and descendants should address that in its specifics
+     * implementations, e.g. Nginx module.
+     */
+#if !(defined(VERSION_IIS)) && !(defined(VERSION_NGINX)) && !(defined(VERSION_STANDALONE))
     if (new_server_signature == NULL) return 0;
 
     server_version = (char *)apache_get_server_version();
@@ -568,7 +627,7 @@ static apr_status_t change_server_signature(server_rec *s) {
     else {
         ap_log_error(APLOG_MARK, APLOG_DEBUG | APLOG_NOERRNO, 0, s, "SecServerSignature: Changed server signature to \"%s\".", server_version);
     }
-
+#endif
     return 1;
 }
 
@@ -646,6 +705,11 @@ static int hook_post_config(apr_pool_t *mp, apr_pool_t *mp_log, apr_pool_t *mp_t
         change_server_signature(s);
     }
 
+    /* For connection level hook */
+    ap_mpm_query(AP_MPMQ_HARD_LIMIT_THREADS, &thread_limit);
+    ap_mpm_query(AP_MPMQ_HARD_LIMIT_DAEMONS, &server_limit);
+
+
 #if (!(defined(WIN32) || defined(NETWARE)))
 
     /* Internal chroot functionality */
@@ -703,9 +767,57 @@ static int hook_post_config(apr_pool_t *mp, apr_pool_t *mp_log, apr_pool_t *mp_t
         /* If we've changed the server signature make note of the original. */
         if (new_server_signature != NULL) {
             ap_log_error(APLOG_MARK, APLOG_NOTICE | APLOG_NOERRNO, 0, s,
-                    "Original server signature: %s", real_server_signature);
+                    "ModSecurity: Original server signature: %s",
+                    real_server_signature);
+        }
+
+#ifndef VERSION_IIS
+        if (status_engine_state != STATUS_ENGINE_DISABLED) {
+            msc_status_engine_call();
+        }
+        else {
+            ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, NULL,
+                    "ModSecurity: Status engine is currently disabled, enable " \
+                    "it by set SecStatusEngine to On.");
+        }
+#endif
+    }
+
+    /**
+     * Checking if it is not the first time that we are in this very function.
+     * We want to show the messages below during the start and the reload.
+     */
+#ifndef VERSION_IIS
+    if (first_time != 1)
+    {
+#ifdef WITH_REMOTE_RULES
+
+        if (remote_rules_server != NULL)
+        {
+            if (remote_rules_server->amount_of_rules == 1)
+            {
+                ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, NULL,
+                    "ModSecurity: Loaded %d rule from: '%s'.",
+                    remote_rules_server->amount_of_rules,
+                    remote_rules_server->uri);
+            }
+            else
+            {
+                ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, NULL,
+                    "ModSecurity: Loaded %d rules from: '%s'.",
+                    remote_rules_server->amount_of_rules,
+                    remote_rules_server->uri);
+            }
+        }
+#endif
+        if (remote_rules_fail_message != NULL)
+        {
+            ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, NULL, "ModSecurity: " \
+                "Problems loading external resources: %s",
+                remote_rules_fail_message);
         }
     }
+#endif
 
     srand((unsigned int)(time(NULL) * getpid()));
 
@@ -764,7 +876,7 @@ static int hook_request_early(request_rec *r) {
         if (msr->request_content_length > msr->txcfg->reqbody_limit) {
             msr_log(msr, 1, "Request body (Content-Length) is larger than the "
                     "configured limit (%ld).", msr->txcfg->reqbody_limit);
-            if(msr->txcfg->is_enabled != MODSEC_DETECTION_ONLY)
+            if(msr->txcfg->is_enabled != MODSEC_DETECTION_ONLY && msr->txcfg->if_limit_action != REQUEST_BODY_LIMIT_ACTION_PARTIAL)
                 return HTTP_REQUEST_ENTITY_TOO_LARGE;
         }
     }
@@ -937,6 +1049,13 @@ static int hook_request_late(request_rec *r) {
                 r->connection->keepalive = AP_CONN_CLOSE;
                 return HTTP_BAD_REQUEST;
                 break;
+            case -7 : /* Partial recieved */
+                if (my_error_msg != NULL) {
+                    msr_log(msr, 4, "%s", my_error_msg);
+                }
+                r->connection->keepalive = AP_CONN_CLOSE;
+                return HTTP_BAD_REQUEST;
+                break;
             default :
                 /* allow through */
                 break;
@@ -993,6 +1112,7 @@ static void hook_error_log(const char *file, int line, int level, apr_status_t s
 {
     modsec_rec *msr = NULL;
     error_message_t *em = NULL;
+    int msr_ap_server;
 
 #if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2
     if (info == NULL) return;
@@ -1009,21 +1129,21 @@ static void hook_error_log(const char *file, int line, int level, apr_status_t s
 
     /* Create a context for requests we never had the chance to process */
 #if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2
-    if ((msr == NULL)
+    msr_ap_server = ((msr == NULL)
         && ((info->level & APLOG_LEVELMASK) < APLOG_DEBUG)
-        && apr_table_get(info->r->subprocess_env, "UNIQUE_ID"))
+        && apr_table_get(info->r->subprocess_env, "UNIQUE_ID"));
 #else
-    if ((msr == NULL)
+    msr_ap_server = ((msr == NULL)
         && ((level & APLOG_LEVELMASK) < APLOG_DEBUG)
-        && apr_table_get(r->subprocess_env, "UNIQUE_ID"))
+        && apr_table_get(r->subprocess_env, "UNIQUE_ID"));
 #endif
-    {
+    if (msr_ap_server) {
 #if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2
         msr = create_tx_context((request_rec *)info->r);
 #else
         msr = create_tx_context((request_rec *)r);
 #endif
-        if (msr->txcfg->debuglog_level >= 9) {
+        if (msr != NULL && msr->txcfg->debuglog_level >= 9) {
             if (msr == NULL) {
                 msr_log(msr, 9, "Failed to create context after request failure.");
             }
@@ -1043,7 +1163,7 @@ static void hook_error_log(const char *file, int line, int level, apr_status_t s
     em->line = info->line;
     em->level = info->level;
     em->status = info->status;
-    if (info->format != NULL) em->message = apr_pstrdup(msr->mp, info->format);
+    em->message = apr_pstrdup(msr->mp, errstr);
 #else
     if (file != NULL) em->file = apr_pstrdup(msr->mp, file);
     em->line = line;
@@ -1319,6 +1439,14 @@ static void modsec_register_operator(const char *name, void *fn_init, void *fn_e
     }
 }
 
+#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2
+#else
+typedef struct {
+    int child_num;
+    int thread_num;
+} sb_handle;
+#endif
+
 /**
  * \brief Connetion hook to limit the number of
  * connections in BUSY state
@@ -1330,60 +1458,67 @@ static void modsec_register_operator(const char *name, void *fn_init, void *fn_e
  */
 static int hook_connection_early(conn_rec *conn)
 {
-    sb_handle *sb = conn->sbh;
-    int i, j;
-    unsigned long int ip_count = 0, ip_count_w = 0;
-    worker_score *ws_record = NULL;
 #if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2
-    ap_sb_handle_t *sbh = NULL;
+    ap_sb_handle_t *sbh = conn->sbh;
+    char *client_ip = conn->client_ip;
+#else
+    sb_handle *sbh = conn->sbh;
+    char *client_ip = conn->remote_ip;
 #endif
+    int i, j;
+    unsigned long int ip_count_r = 0, ip_count_w = 0;
+    char *error_msg;
+    worker_score *ws_record = NULL;
 
-    if(sb != NULL && (conn_read_state_limit > 0 || conn_write_state_limit > 0))   {
+    if (sbh != NULL && (conn_read_state_limit > 0 || conn_write_state_limit > 0)) {
 
-        ws_record = &ap_scoreboard_image->servers[sb->child_num][sb->thread_num];
-        if(ws_record == NULL)
+#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2
+        ws_record = ap_get_scoreboard_worker(sbh);
+#else
+        ws_record = ap_get_scoreboard_worker(sbh->child_num, sbh->thread_num);
+#endif
+        if (ws_record == NULL)
             return DECLINED;
 
-#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2
-        apr_cpystrn(ws_record->client, conn->client_ip, sizeof(ws_record->client));
-#else
-        apr_cpystrn(ws_record->client, conn->remote_ip, sizeof(ws_record->client));
-#endif
+        /* If ws_record does not have correct ip yet, we count it already */
+        if (strcmp(client_ip, ws_record->client) != 0) {
+            switch (ws_record->status) {
+                case SERVER_BUSY_READ:
+                    ip_count_r++;
+                    break;
+                case SERVER_BUSY_WRITE:
+                    ip_count_w++;
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, conn,
+            "ModSecurity: going to loop through %d servers with %d threads",
+            server_limit, thread_limit);
         for (i = 0; i < server_limit; ++i) {
             for (j = 0; j < thread_limit; ++j) {
 
 #if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2
-                sbh = conn->sbh;
-                if (sbh == NULL)        {
-                    return DECLINED;
-                }
-
-                ws_record = ap_get_scoreboard_worker(sbh);
+                ws_record = ap_get_scoreboard_worker_from_indexes(i, j);
 #else
                 ws_record = ap_get_scoreboard_worker(i, j);
 #endif
 
-                if(ws_record == NULL)
+                if (ws_record == NULL)
                     return DECLINED;
 
                 switch (ws_record->status) {
                     case SERVER_BUSY_READ:
-#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2
-                        if (strcmp(conn->client_ip, ws_record->client) == 0)
-                            ip_count++;
-#else
-                        if (strcmp(conn->remote_ip, ws_record->client) == 0)
-                            ip_count++;
-#endif
+                        if (strcmp(client_ip, ws_record->client) == 0)
+                            ip_count_r++;
                         break;
+
                     case SERVER_BUSY_WRITE:
-#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2
-                        if (strcmp(conn->client_ip, ws_record->client) == 0)
+                        if (strcmp(client_ip, ws_record->client) == 0)
                             ip_count_w++;
-#else
-                        if (strcmp(conn->remote_ip, ws_record->client) == 0)
-                            ip_count_w++;
-#endif
+
                         break;
                     default:
                         break;
@@ -1391,22 +1526,80 @@ static int hook_connection_early(conn_rec *conn)
             }
         }
 
-        if ((conn_read_state_limit > 0) && (ip_count > conn_read_state_limit)) {
-#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2
-            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, "ModSecurity: Access denied with code 400. Too many threads [%ld] of %ld allowed in READ state from %s - Possible DoS Consumption Attack [Rejected]", ip_count,conn_read_state_limit,conn->client_ip);
-#else
-            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, "ModSecurity: Access denied with code 400. Too many threads [%ld] of %ld allowed in READ state from %s - Possible DoS Consumption Attack [Rejected]", ip_count,conn_read_state_limit,conn->remote_ip);
-#endif
-            return OK;
-        } else if ((conn_write_state_limit > 0) && (ip_count_w > conn_write_state_limit)) {
-#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER > 2
-            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, "ModSecurity: Access denied with code 400. Too many threads [%ld] of %ld allowed in WRITE state from %s - Possible DoS Consumption Attack [Rejected]", ip_count_w,conn_write_state_limit,conn->client_ip);
-#else
-            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, "ModSecurity: Access denied with code 400. Too many threads [%ld] of %ld allowed in WRITE state from %s - Possible DoS Consumption Attack [Rejected]", ip_count_w,conn_write_state_limit,conn->remote_ip);
-#endif
-            return OK;
-        } else {
-            return DECLINED;
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, conn,
+            "ModSecurity: threads in READ: %ld of %ld, WRITE: %ld of %ld, IP: %s",
+            ip_count_r, conn_read_state_limit, ip_count_w, conn_write_state_limit, client_ip);
+
+        if (conn_read_state_limit > 0 && ip_count_r > conn_read_state_limit)
+        {
+            if (conn_read_state_suspicious_list &&
+                (tree_contains_ip(conn->pool,
+                   conn_read_state_suspicious_list, client_ip, NULL, &error_msg) <= 0))
+            {
+                if (conn_limits_filter_state == MODSEC_DETECTION_ONLY)
+                    ap_log_cerror(APLOG_MARK, APLOG_WARNING, 0, conn,
+                        "ModSecurity: Too many threads [%ld] of %ld allowed " \
+                        "in READ state from %s - There is a suspission list " \
+                        "but that IP is not part of it, access granted",
+                        ip_count_r, conn_read_state_limit, client_ip);
+            }
+            else if (tree_contains_ip(conn->pool,
+                conn_read_state_whitelist, client_ip, NULL, &error_msg) > 0)
+            {
+                if (conn_limits_filter_state == MODSEC_DETECTION_ONLY)
+                    ap_log_cerror(APLOG_MARK, APLOG_WARNING, 0, conn,
+                        "ModSecurity: Too many threads [%ld] of %ld allowed " \
+                        "in READ state from %s - Ip is on whitelist, access " \
+                        "granted", ip_count_r, conn_read_state_limit,
+                        client_ip);
+            }
+            else
+            {
+                ap_log_cerror(APLOG_MARK, APLOG_WARNING, 0, conn,
+                    "ModSecurity: Access denied with code 400. Too many " \
+                    "threads [%ld] of %ld allowed in READ state from %s - " \
+                    "Possible DoS Consumption Attack [Rejected]", ip_count_r,
+                    conn_read_state_limit, client_ip);
+
+                if (conn_limits_filter_state == MODSEC_ENABLED)
+                    return OK;
+            }
+        }
+
+        if (conn_write_state_limit > 0 && ip_count_w > conn_write_state_limit)
+        {
+            if (conn_write_state_suspicious_list &&
+                (tree_contains_ip(conn->pool,
+                    conn_write_state_suspicious_list, client_ip, NULL, &error_msg) <= 0))
+            {
+                if (conn_limits_filter_state == MODSEC_DETECTION_ONLY)
+                    ap_log_cerror(APLOG_MARK, APLOG_WARNING, 0, conn,
+                        "ModSecurity: Too many threads [%ld] of %ld allowed " \
+                        "in WRITE state from %s - There is a suspission list " \
+                        "but that IP is not part of it, access granted",
+                        ip_count_w, conn_read_state_limit, client_ip);
+            }
+            else if (tree_contains_ip(conn->pool,
+                conn_write_state_whitelist, client_ip, NULL, &error_msg) > 0)
+            {
+                if (conn_limits_filter_state == MODSEC_DETECTION_ONLY)
+                    ap_log_cerror(APLOG_MARK, APLOG_WARNING, 0, conn,
+                        "ModSecurity: Too many threads [%ld] of %ld allowed " \
+                        "in WRITE state from %s - Ip is on whitelist, " \
+                        "access granted", ip_count_w, conn_read_state_limit,
+                        client_ip);
+            }
+            else
+            {
+                ap_log_cerror(APLOG_MARK, APLOG_WARNING, 0, conn,
+                    "ModSecurity: Access denied with code 400. Too many " \
+                    "threads [%ld] of %ld allowed in WRITE state from %s - " \
+                    "Possible DoS Consumption Attack [Rejected]", ip_count_w,
+                    conn_write_state_limit, client_ip);
+
+                if (!conn_limits_filter_state == MODSEC_ENABLED)
+                    return OK;
+            }
         }
     }
 
@@ -1468,6 +1661,7 @@ static void register_hooks(apr_pool_t *mp) {
     static const char *const postread_beforeme_list[] = {
         "mod_rpaf.c",
         "mod_rpaf-2.0.c",
+        "mod_extract_forwarded.c",
         "mod_extract_forwarded2.c",
         "mod_remoteip.c",
         "mod_custom_header.c",
@@ -1505,10 +1699,6 @@ static void register_hooks(apr_pool_t *mp) {
     APR_REGISTER_OPTIONAL_FN(modsec_register_variable);
     APR_REGISTER_OPTIONAL_FN(modsec_register_reqbody_processor);
 #endif
-
-    /* For connection level hook */
-    ap_mpm_query(AP_MPMQ_HARD_LIMIT_THREADS, &thread_limit);
-    ap_mpm_query(AP_MPMQ_HARD_LIMIT_DAEMONS, &server_limit);
 
     /* Main hooks */
     ap_hook_pre_config(hook_pre_config, NULL, NULL, APR_HOOK_FIRST);

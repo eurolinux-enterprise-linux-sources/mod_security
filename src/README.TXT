@@ -1,5 +1,5 @@
 ModSecurity for Apache 2.x, http://www.modsecurity.org/
-Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 
 You may not use this file except in compliance with
 the License.  You may obtain a copy of the License at
@@ -23,8 +23,7 @@ OWASP ModSecurity Core Rule Set (CRS)
 
 
 Project Site:
-https://www.owasp.org/index.php/Category:OWASP_ModSecurity_Core_Rule_Set_Pr
-oject
+https://www.owasp.org/index.php/Category:OWASP_ModSecurity_Core_Rule_Set_Project
 
 
 Download:
@@ -72,7 +71,7 @@ server.
 ModSecurity Rules from Trustwave SpiderLabs
 
 Project Site:
-hhttps://www.trustwave.com/modsecurity-rules-support.php
+https://www.trustwave.com/modsecurity-rules-support.php
 
 Download:
 https://ssl.trustwave.com/web-application-firewall
@@ -101,7 +100,7 @@ vulnerability classes for applications such as:
  * Joomla
  * For a complete listing of application coverage, please refer to this
 link (which is updated daily).
-https://modsecurity.org/projects/commercial/rules/application_coverage.html
+https://modsecurity.org/application_coverage.html
 
 3. Complements and integrates with the OWASP Core Rule Set
 4. IP Reputation capabilities which provide protection against malicious

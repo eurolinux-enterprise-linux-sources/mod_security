@@ -6,7 +6,7 @@ dnl
 
 AC_PREREQ(2.63)
 
-AC_INIT([modsecurity], [2.7], [support@modsecurity.org])
+AC_INIT([modsecurity], [2.9], [support@modsecurity.org])
 
 AC_CONFIG_MACRO_DIR([build])
 AC_CONFIG_SRCDIR([LICENSE])
@@ -14,7 +14,7 @@ AC_CONFIG_HEADERS([apache2/modsecurity_config_auto.h])
 AC_CONFIG_AUX_DIR([build])
 AC_PREFIX_DEFAULT([/usr/local/modsecurity])
 
-AM_INIT_AUTOMAKE([-Wall foreign])
+AM_INIT_AUTOMAKE([-Wall foreign subdir-objects])
 m4_ifdef([AM_PROG_AR], [AM_PROG_AR])
 
 LT_PREREQ([2.2])
@@ -33,7 +33,7 @@ AC_PATH_PROGS(ENV_CMD, [env printenv], )
 
 # Checks for header files.
 AC_HEADER_STDC
-AC_CHECK_HEADERS([fcntl.h limits.h stdlib.h string.h unistd.h sys/types.h sys/stat.h])
+AC_CHECK_HEADERS([fcntl.h limits.h stdlib.h string.h unistd.h sys/types.h sys/stat.h sys/utsname.h])
 
 # Checks for typedefs, structures, and compiler characteristics.
 AC_C_CONST
@@ -70,6 +70,22 @@ AC_SUBST(MSC_REGRESSION_DOCROOT_DIR)
 
 ### Configure Options
 
+# Verbose output
+AC_ARG_ENABLE(verbose-output,
+              AS_HELP_STRING([--enable-verbose-output],
+                             [Enable more verbose configure output.]),
+[
+  if test "$enableval" != "no"; then
+    verbose_output=1
+  else
+    verbose_output=0
+  fi
+],
+[
+  verbose_output=0
+])
+
+
 #OS type
 
 AC_CANONICAL_HOST
@@ -87,19 +103,19 @@ AH_TEMPLATE([NETBSD],  [Define if the operating system is NetBSD])
 
 case $host in
   *-*-aix*)
-    echo "Checking plataform... Identified as AIX"
+    echo "Checking platform... Identified as AIX"
     aixos=true
     ;;
   *-*-hpux*)
-    echo "Checking plataform... Identified as HPUX"
+    echo "Checking platform... Identified as HPUX"
     hpuxos=true
     ;;
   *-*-darwin*)
-    echo "Checking plataform... Identified as Macintosh OS X"
+    echo "Checking platform... Identified as Macintosh OS X"
     macos=true
     ;;
   *-*-linux*)
-    echo "Checking plataform... Identified as Linux"
+    echo "Checking platform... Identified as Linux"
     linuxos=true
         case "${host_cpu}" in
             s390x)
@@ -108,27 +124,27 @@ case $host in
         esac
     ;;
   *-*-solaris*)
-    echo "Checking plataform... Identified as Solaris"
+    echo "Checking platform... Identified as Solaris"
     solarisos=true
     ;;
   *-*-freebsd*)
-    echo "Checking plataform... Identified as FreeBSD"
+    echo "Checking platform... Identified as FreeBSD"
     freebsdos=true
     ;;
   *-*-netbsd*)
-    echo "Checking plataform... Identified as NetBSD"
+    echo "Checking platform... Identified as NetBSD"
     netbsdos=true
     ;;
   *-*-openbsd*)
-    echo "Checking plataform... Identified as OpenBSD"
+    echo "Checking platform... Identified as OpenBSD"
     openbsdos=true
     ;;
   *-*-kfreebsd*)
-    echo "Checking plataform... Identified as kFreeBSD, treating as linux"
+    echo "Checking platform... Identified as kFreeBSD, treating as linux"
     linuxos=true
     ;;
   *-*-gnu*.*)
-    echo "Checking plataform... Identified as HURD, treating as linux"
+    echo "Checking platform... Identified as HURD, treating as linux"
     linuxos=true
     ;;
        *)
@@ -224,6 +240,14 @@ AC_ARG_ENABLE(mlogc,
 [
   build_mlogc=1
 ])
+
+CHECK_CURL()
+
+if test -z "${CURL_VERSION}"; then
+  AC_MSG_NOTICE([NOTE: mlgoc compilation was disabled.])
+  build_mlogc=0
+fi
+
 AM_CONDITIONAL([BUILD_MLOGC], [test "$build_mlogc" -eq 1])
 if test "$build_mlogc" -eq 1; then
   TOPLEVEL_SUBDIRS="$TOPLEVEL_SUBDIRS mlogc"
@@ -264,7 +288,20 @@ AC_ARG_ENABLE(docs,
 ])
 AM_CONDITIONAL([BUILD_DOCS], [test "$build_docs" -eq 1])
 if test "$build_docs" -eq 1; then
-    TOPLEVEL_SUBDIRS="$TOPLEVEL_SUBDIRS docs"
+    TOPLEVEL_SUBDIRS="$TOPLEVEL_SUBDIRS doc"
+    AC_CHECK_PROGS([DOXYGEN], [doxygen])
+    if test -z "$DOXYGEN"; then
+        AC_MSG_WARN([Doxygen not found - continue without Doxygen support])
+    fi
+    if test "$build_apache2_module" -eq 1; then
+       AC_CONFIG_FILES([doc/doxygen-apache])
+    fi
+    if test "$build_standalone_module" -eq 1; then
+       AC_CONFIG_FILES([doc/doxygen-nginx])
+       AC_CONFIG_FILES([doc/doxygen-iis])
+       AC_CONFIG_FILES([doc/doxygen-standalone])
+    fi
+    AC_CONFIG_FILES([doc/Makefile])
 fi
 
 
@@ -374,7 +411,7 @@ AC_ARG_ENABLE(htaccess-config,
 # Enable phase-1 in post_read_request
 AC_ARG_ENABLE(request-early,
               AS_HELP_STRING([--enable-request-early],
-                             [Place phase1 into post_read_request hook.]),
+                             [Place phase1 into post_read_request hook. default is hook_request_early]),
 [
   if test "$enableval" != "no"; then
     request_early="-DREQUEST_EARLY"
@@ -386,6 +423,144 @@ AC_ARG_ENABLE(request-early,
 [
   request_early='-DREQUEST_EARLY'
 ])
+
+# Enable duplicate rules id
+AC_ARG_ENABLE(rule-id-validation,
+              AS_HELP_STRING([--enable-rule-id-validation],
+                             [Forbid duplicate rule ids and missing ones. This is the default]),
+[
+  if test "$enableval" != "no"; then
+    unique_id=
+  else
+    unique_id="-DALLOW_ID_NOT_UNIQUE"
+    MODSEC_EXTRA_CFLAGS="$MODSEC_EXTRA_CFLAGS $unique_id"
+  fi
+],
+[
+  unique_id=''
+])
+
+# Disable logging of filename
+AC_ARG_ENABLE(filename-logging,
+              AS_HELP_STRING([--enable-filename-logging],
+                             [Enable logging of filename in audit log. This is the default]),
+[
+  if test "$enableval" != "no"; then
+    log_filename=
+  else
+    log_filename="-DLOG_NO_FILENAME"
+  fi
+],
+[
+  log_filename=''
+])
+
+# Disable logging of "Server"
+AC_ARG_ENABLE(server-logging,
+              AS_HELP_STRING([--enable-server-logging],
+                             [Enable logging of "Server" in audit log when log level < 9. This is the default]),
+[
+  if test "$enableval" != "no"; then
+    log_server=
+  else
+    log_server="-DLOG_NO_SERVER"
+  fi
+],
+[
+  log_server=''
+])
+
+# Disable logging of problem when deleting collection
+AC_ARG_ENABLE(collection-delete-problem-logging,
+              AS_HELP_STRING([--enable-collection-delete-problem-logging],
+                             [Enable logging of collection delete problem even when log level is < 9. This is the default]),
+[
+  if test "$enableval" != "no"; then
+    log_collection_delete_problem=
+  else
+    log_collection_delete_problem="-DLOG_NO_COLL_DELET_PB"
+  fi
+],
+[
+  log_collection_delete_problem=''
+])
+
+# Disable logging of Apache handler
+AC_ARG_ENABLE(handler-logging,
+              AS_HELP_STRING([--enable-handler-logging],
+                             [Enable logging of Apache handler in audit log even when log level is < 9. This is the default]),
+[
+  if test "$enableval" != "no"; then
+    log_handler=
+  else
+    log_handler="-DLOG_NO_HANDLER"
+  fi
+],
+[
+  log_handler=''
+])
+
+# Disable logging of dechunking
+AC_ARG_ENABLE(dechunk-logging,
+              AS_HELP_STRING([--enable-dechunk-logging],
+                             [Enable logging of dechunking even when log level is < 9. This is the default]),
+[
+  if test "$enableval" != "no"; then
+    log_dechunk=
+  else
+    log_dechunk="-DLOG_NO_DECHUNK"
+  fi
+],
+[
+  log_dechunk=''
+])
+
+# Disable logging of stopwatches
+AC_ARG_ENABLE(stopwatch-logging,
+              AS_HELP_STRING([--enable-stopwatch-logging],
+                             [Enable logging of stopwatches even when log level is < 9. This is the default]),
+[
+  if test "$enableval" != "no"; then
+    log_stopwatch=
+  else
+    log_stopwatch="-DLOG_NO_STOPWATCH"
+  fi
+],
+[
+  log_stopwatch=''
+])
+
+# Disable logging of server context
+AC_ARG_ENABLE(server-context-logging,
+              AS_HELP_STRING([--enable-server-context-logging],
+                             [Enable logging of server info (log producer, sanitized objects, ...) in audit log even when log level < 9. This is the default]),
+[
+  if test "$enableval" != "no"; then
+    log_server_context=
+  else
+    log_server_context="-DLOG_NO_SERVER_CONTEXT"
+  fi
+],
+[
+  log_server_context=''
+])
+
+
+# Enable collection's global lock
+AC_ARG_ENABLE(collection-global-lock,
+              AS_HELP_STRING([--enable-collection-global-lock],
+                             [Enable collection correctness by using a global lock. May reduce performance significatively. This is disabled by default]),
+[
+  if test "$enableval" != "yes"; then
+    collection_global_lock=""
+  else
+    collection_global_lock="-DGLOBAL_COLLECTION_LOCK"
+  fi
+],
+[
+  collection_global_lock=''
+])
+
 
 # Ignore configure errors
 AC_ARG_ENABLE(errors,
@@ -402,20 +577,6 @@ AC_ARG_ENABLE(errors,
   report_errors=1
 ])
 
-# Verbose output
-AC_ARG_ENABLE(verbose-output,
-              AS_HELP_STRING([--enable-verbose-output],
-                             [Enable more verbose configure output.]),
-[
-  if test "$enableval" != "no"; then
-    verbose_output=1
-  else
-    verbose_output=0
-  fi
-],
-[
-  verbose_output=0
-])
 
 # Strict Compile
 AC_ARG_ENABLE(strict-compile,
@@ -618,6 +779,7 @@ VERSION_OK
   APXS_PROGNAME="`$APXS -q PROGNAME`"
   if test "$verbose_output" -eq 1; then AC_MSG_NOTICE(apxs PROGNAME: $APXS_PROGNAME); fi
   APXS_LIBEXECDIR="`$APXS -q LIBEXECDIR`"
+  if test "xx$APXS_LIBEXECDIR" = "xx"; then APXS_LIBEXECDIR="`$APXS -q LIBDIR`/modules"; fi
   if test "$verbose_output" -eq 1; then AC_MSG_NOTICE(apxs LIBEXECDIR: $APXS_LIBEXECDIR); fi
   APXS_MODULES=$APXS_LIBEXECDIR
   if test "$verbose_output" -eq 1; then AC_MSG_NOTICE(apxs MODULES: $APXS_MODULES); fi
@@ -650,7 +812,7 @@ else
   fi
 fi
 
-MODSEC_EXTRA_CFLAGS="$pcre_study $pcre_match_limit $pcre_match_limit_recursion $pcre_jit $request_early $htaccess_config $lua_cache $debug_conf $debug_cache $debug_acmp $debug_mem $perf_meas $modsec_api $cpu_type"
+MODSEC_EXTRA_CFLAGS="$pcre_study $pcre_match_limit $pcre_match_limit_recursion $pcre_jit $request_early $htaccess_config $lua_cache $debug_conf $debug_cache $debug_acmp $debug_mem $perf_meas $modsec_api $cpu_type $unique_id $log_filename $log_server $log_collection_delete_problem $log_dechunk $log_stopwatch $log_handler $log_server_contex $collection_global_lock"
 
 APXS_WRAPPER=build/apxs-wrapper
 APXS_EXTRA_CFLAGS=""
@@ -693,8 +855,43 @@ CHECK_APU()
 fi
 CHECK_LIBXML2()
 CHECK_LUA()
-if test "$build_mlogc" -ne 0; then
-CHECK_CURL()
+#if test "$build_mlogc" -ne 0; then
+#CHECK_CURL()
+#fi
+
+# Check for YAJL libs (for JSON body processor)
+CHECK_YAJL()
+#AC_SEARCH_LIBS([yajl_alloc], [yajl])
+CHECK_SSDEEP()
+#AC_SEARCH_LIBS([fuzzy_hash_buf], [fuzzy])
+
+# Temporarily set cflags for apr_crypto check, then restore
+# since it's already used correctly to compile modsecurity module.
+ORIG_CFLAGS="$CFLAGS $APU_CFLAGS"
+ORIG_CPPFLAGS="$CPPFLAGS"
+CFLAGS="$CFLAGS $APR_CFLAGS"
+CPPFLAGS="$CPPFLAGS $APR_CPPFLAGS"
+AC_TRY_COMPILE(
+	[#include <apr_crypto.h>],
+	[
+          #if APU_HAVE_CRYPTO == 0
+          #error APR util was not compiled with crypto support.
+          #endif
+	],
+	[ AC_DEFINE([WITH_APU_CRYPTO], [1], [APR util was compiled with crypto support])
+	  MODSEC_EXTRA_CFLAGS="$MODSEC_EXTRA_CFLAGS -DWITH_APU_CRYPTO"
+	],
+	[ AC_MSG_WARN([APR util was not compiled with crypto support. SecRemoteRule will not support the parameter 'crypto']) ]
+)
+# Restore env vars so that we don't clutter with duplicates that
+# are eventually appended later on
+CFLAGS="$ORIG_CFLAGS"
+CPPFLAGS="$ORIG_CPPFLAGS"
+
+# Current our unique download backend is curl, furhter we can support more.
+if test ! -z "${CURL_VERSION}"; then
+  AC_DEFINE([WITH_REMOTE_RULES], [1], [Enables SecRemoteRules support])
+  MODSEC_EXTRA_CFLAGS="$MODSEC_EXTRA_CFLAGS -DWITH_REMOTE_RULES"
 fi
 
 AC_CONFIG_FILES([Makefile])
@@ -707,6 +904,7 @@ AC_CONFIG_FILES([apache2/Makefile])
 fi
 if test "$build_standalone_module" -ne 0; then
 AC_CONFIG_FILES([standalone/Makefile])
+AC_CONFIG_FILES([nginx/modsecurity/config])
 fi
 if test "$build_extentions" -ne 0; then
 AC_CONFIG_FILES([ext/Makefile])
@@ -715,6 +913,9 @@ AC_CONFIG_FILES([build/apxs-wrapper], [chmod +x build/apxs-wrapper])
 if test -e "$PERL"; then
     if test "$build_mlogc" -ne 0; then
         AC_CONFIG_FILES([mlogc/mlogc-batch-load.pl], [chmod +x mlogc/mlogc-batch-load.pl])
+        AC_CONFIG_FILES([tests/regression/misc/40-secRemoteRules.t])
+        AC_CONFIG_FILES([tests/regression/misc/50-ipmatchfromfile-external.t])
+        AC_CONFIG_FILES([tests/regression/misc/60-pmfromfile-external.t])
     fi
     AC_CONFIG_FILES([tests/run-unit-tests.pl], [chmod +x tests/run-unit-tests.pl])
     AC_CONFIG_FILES([tests/run-regression-tests.pl], [chmod +x tests/run-regression-tests.pl])

@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -19,7 +19,6 @@
 #define POSITIVE_VALUE 1
 #define NEGATIVE_VALUE 2
 
-typedef struct msre_ipmatch msre_ipmatch;
 typedef struct msre_engine msre_engine;
 typedef struct msre_ruleset msre_ruleset;
 typedef struct msre_ruleset_internal msre_ruleset_internal;
@@ -38,6 +37,7 @@ typedef struct msre_cache_rec msre_cache_rec;
 #include "apr_tables.h"
 #include "modsecurity.h"
 #include "msc_pcre.h"
+#include "msc_tree.h"
 #include "persist_dbm.h"
 #include "apache2.h"
 #include "http_config.h"
@@ -139,12 +139,6 @@ int DSOLOCAL msre_ruleset_phase_rule_remove_with_exception(msre_ruleset *ruleset
 #define RULE_TYPE_LUA           3  /* SecRuleScript */
 #endif
 
-struct msre_ipmatch  {
-    apr_ipsubnet_t *ipsubnet;
-    const char * address;
-    struct  msre_ipmatch *next;
-};
-
 struct msre_rule {
     apr_array_header_t      *targets;
     const char              *op_name;
@@ -183,7 +177,7 @@ struct msre_rule {
     int                     re_precomp;
     int                     escape_re;
 
-    msre_ipmatch            *ip_op;
+    TreeRoot                *ip_op;
 };
 
 char DSOLOCAL *msre_rule_generate_unparsed(apr_pool_t *pool, const msre_rule *rule, const char *targets, const char *args, const char *actions);
@@ -325,10 +319,10 @@ void DSOLOCAL msre_engine_variable_register(msre_engine *engine, const char *nam
     fn_var_validate_t validate, fn_var_generate_t generate,
     unsigned int is_cacheable, unsigned int availability);
 
-msre_actionset DSOLOCAL *msre_actionset_create(msre_engine *engine, const char *text,
+msre_actionset DSOLOCAL *msre_actionset_create(msre_engine *engine, apr_pool_t *mp, const char *text,
     char **error_msg);
 
-msre_actionset DSOLOCAL *msre_actionset_merge(msre_engine *engine, msre_actionset *parent,
+msre_actionset DSOLOCAL *msre_actionset_merge(msre_engine *engine, apr_pool_t *mp, msre_actionset *parent,
     msre_actionset *child, int inherit_by_default);
 
 msre_actionset DSOLOCAL *msre_actionset_create_default(msre_engine *engine);
@@ -337,8 +331,8 @@ void DSOLOCAL msre_actionset_set_defaults(msre_actionset *actionset);
 
 void DSOLOCAL msre_actionset_init(msre_actionset *actionset, msre_rule *rule);
 
-typedef char *(*fn_action_validate_t)(msre_engine *engine, msre_action *action);
-typedef apr_status_t (*fn_action_init_t)(msre_engine *engine, msre_actionset *actionset, msre_action *action);
+typedef char *(*fn_action_validate_t)(msre_engine *engine, apr_pool_t *mp, msre_action *action);
+typedef apr_status_t (*fn_action_init_t)(msre_engine *engine, apr_pool_t *mp, msre_actionset *actionset, msre_action *action);
 typedef apr_status_t (*fn_action_execute_t)(modsec_rec *msr, apr_pool_t *mptmp, msre_rule *rule, msre_action *action);
 
 #define ACTION_DISRUPTIVE       1
@@ -413,6 +407,17 @@ struct msre_cache_rec {
     const char              *path;
     const char              *val;
     apr_size_t               val_len;
+};
+
+struct fuzzy_hash_chunk {
+    const char *data;
+    struct fuzzy_hash_chunk *next;
+};
+
+struct fuzzy_hash_param_data {
+    const char *file;
+    struct fuzzy_hash_chunk *head;
+    int threshold;
 };
 
 #endif

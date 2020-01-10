@@ -2,6 +2,7 @@ dnl Check for CURL Libraries
 dnl CHECK_CURL(ACTION-IF-FOUND [, ACTION-IF-NOT-FOUND])
 dnl Sets:
 dnl  CURL_CFLAGS
+dnl  CURL_LDADD
 dnl  CURL_LIBS
 
 CURL_CONFIG=""
@@ -57,7 +58,8 @@ if test -n "${curl_path}"; then
     if test "$verbose_output" -eq 1; then AC_MSG_NOTICE(curl VERSION: $CURL_VERSION); fi
     CURL_CFLAGS="`${CURL_CONFIG} --cflags`"
     if test "$verbose_output" -eq 1; then AC_MSG_NOTICE(curl CFLAGS: $CURL_CFLAGS); fi
-    CURL_LDADD="`${CURL_CONFIG} --libs`"
+    CURL_LIBS="`${CURL_CONFIG} --libs`"
+    CURL_LDADD="${CURL_LIBS}"
     if test "$verbose_output" -eq 1; then AC_MSG_NOTICE(curl LDADD: $CURL_LIBS); fi
 
     dnl # Check version is ok
@@ -66,6 +68,11 @@ if test -n "${curl_path}"; then
     curl_ver=`echo ${CURL_VERSION} | awk -F. '{print (\$ 1 * 1000000) + (\$ 2 * 1000) + \$ 3}'`
     if test "$curl_min_ver" -le "$curl_ver"; then
         AC_MSG_RESULT([yes, $CURL_VERSION])
+	curl_tlsv2_ver=`echo 7.34.0 | awk -F. '{print (\$ 1 * 1000000) + (\$ 2 * 1000) + \$ 3}'`
+	if test "$curl_tlsv2_ver" -le "$curl_ver"; then
+	    CURL_CFLAGS="${CURL_CFLAGS} -DWITH_CURL_SSLVERSION_TLSv1_2"
+	fi
+	CURL_CFLAGS="${CURL_CFLAGS} -DWITH_CURL"
     else
         AC_MSG_RESULT([no, $CURL_VERSION])
         AC_MSG_NOTICE([NOTE: curl library may be too old])

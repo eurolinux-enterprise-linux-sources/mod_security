@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -27,6 +27,7 @@
 
 #include "modsecurity.h"
 #include "re.h"
+#include "msc_tree.h"
 
 #ifdef WIN32
 #include <ws2tcpip.h>
@@ -146,4 +147,36 @@ char DSOLOCAL *format_all_performance_variables(modsec_rec *msr, apr_pool_t *mp)
 unsigned char DSOLOCAL is_netmask_v4(char *ip_strv4);
 
 unsigned char DSOLOCAL is_netmask_v6(char *ip_strv6);
+
+int DSOLOCAL msc_headers_to_buffer(const apr_array_header_t *arr, char *buffer, int max_length);
+
+int DSOLOCAL ip_tree_from_file(TreeRoot **rtree, char *uri,
+    apr_pool_t *mp, char **error_msg);
+
+int DSOLOCAL tree_contains_ip(apr_pool_t *mp, TreeRoot *rtree,
+    const char *value, modsec_rec *msr, char **error_msg);
+
+int DSOLOCAL ip_tree_from_param(apr_pool_t *pool,
+    char *param, TreeRoot **rtree, char **error_msg);
+
+#ifdef WITH_CURL
+int ip_tree_from_uri(TreeRoot **rtree, char *uri,
+    apr_pool_t *mp, char **error_msg);
+#endif
+
+int read_line(char *buff, int size, FILE *fp);
+
+size_t msc_curl_write_memory_cb(void *contents, size_t size,
+    size_t nmemb, void *userp);
+
+struct msc_curl_memory_buffer_t
+{
+   char *memory;
+   size_t size;
+};
+
+#ifdef WIN32
+char *strtok_r(char *str, const char *delim, char **nextp);
+#endif
+
 #endif

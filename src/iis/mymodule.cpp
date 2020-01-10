@@ -1,6 +1,6 @@
 ﻿/*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -67,6 +67,10 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
 		{
 			modsecFinishRequest(m_pRequestRec);
 			m_pRequestRec = NULL;
+		}
+		if(m_pConnRec != NULL)
+		{
+			modsecFinishConnection(m_pConnRec);
 			m_pConnRec = NULL;
 		}
 	}
@@ -84,6 +88,10 @@ class REQUEST_STORED_CONTEXT : public IHttpStoredContext
 
 char *GetIpAddr(apr_pool_t *pool, PSOCKADDR pAddr)
 {
+	const char *format = "%15[0-9.]:%5[0-9]";
+	char ip[16] = { 0 };  // ip4 addresses have max len 15
+	char port[6] = { 0 }; // port numbers are 16bit, ie 5 digits max
+
 	DWORD len = 50;
 	char *buf = (char *)apr_palloc(pool, len);
 
@@ -93,6 +101,14 @@ char *GetIpAddr(apr_pool_t *pool, PSOCKADDR pAddr)
 	buf[0] = 0;
 
 	WSAAddressToString(pAddr, sizeof(SOCKADDR), NULL, buf, &len);
+
+	// test for IPV4 with port on the end
+	if (sscanf(buf, format, ip, port) == 2) {
+		// IPV4 but with port - remove the port
+		char* input = ":";
+		char* ipv4 = strtok(buf, input);
+		return ipv4;
+	}
 
 	return buf;
 }
@@ -792,6 +808,13 @@ CMyHttpModule::OnBeginRequest(
 					delete path;
 					goto Finished;
 				}
+
+				modsecReportRemoteLoadedRules();
+				if (this->status_call_already_sent == false)
+				{
+					this->status_call_already_sent = true;
+					modsecStatusEngineCall();
+				}
 			}
 			delete apppath;
 		}
@@ -1247,6 +1270,8 @@ CMyHttpModule::CMyHttpModule()
     GetSystemInfo(&sysInfo);
     m_dwPageSize = sysInfo.dwPageSize;
 
+    this->status_call_already_sent = false;
+
 	InitializeCriticalSection(&m_csLock);
 
 	modsecSetLogHook(this, Log);
@@ -1303,7 +1328,7 @@ BOOL CMyHttpModule::WriteEventViewerLog(LPCSTR szNotification, WORD category)
         // Write any strings to the Event Viewer and return.
         return ReportEvent(
             m_hEventLog,
-            category, 0, 0,
+            category, 0, 0x1,
             NULL, 1, 0, &szNotification, NULL );
     }
     return FALSE;

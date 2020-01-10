@@ -85,6 +85,9 @@
 /* Define to 1 if you have the <sys/types.h> header file. */
 #undef HAVE_SYS_TYPES_H
 
+/* Define to 1 if you have the <sys/utsname.h> header file. */
+#undef HAVE_SYS_UTSNAME_H
+
 /* Define to 1 if you have the <unistd.h> header file. */
 #undef HAVE_UNISTD_H
 
@@ -94,8 +97,7 @@
 /* Define if the operating system is LINUX */
 #undef LINUX
 
-/* Define to the sub-directory in which libtool stores uninstalled libraries.
-   */
+/* Define to the sub-directory where libtool stores uninstalled libraries. */
 #undef LT_OBJDIR
 
 /* Define if the operating system is Macintosh OSX */
@@ -139,6 +141,12 @@
 
 /* Version number of package */
 #undef VERSION
+
+/* APR util was compiled with crypto support */
+#undef WITH_APU_CRYPTO
+
+/* Enables SecRemoteRules support */
+#undef WITH_REMOTE_RULES
 
 /* Define for Solaris 2.5.1 so the uint8_t typedef from <sys/synch.h>,
    <pthread.h>, or <semaphore.h> is not used. If the typedef were allowed, the

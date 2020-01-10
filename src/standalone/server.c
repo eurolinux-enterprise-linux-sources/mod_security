@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -187,6 +187,11 @@ static char *http2env(apr_pool_t *a, const char *w)
     return res;
 }
 
+AP_DECLARE(apr_uint32_t) ap_random_pick(apr_uint32_t min, apr_uint32_t max)
+{
+    return rand();
+}
+
 AP_DECLARE(char *) ap_escape_html2(apr_pool_t *p, const char *s, int toasc)
 {
     int i, j;
@@ -269,6 +274,58 @@ AP_DECLARE(void) ap_log_error(const char *file, int line, int level,
 AP_DECLARE(void) ap_log_error_(const char *file, int line, int module_index,
                                int level, apr_status_t status,
                                const server_rec *s, const char *fmt, ...)
+//                              __attribute__((format(printf,7,8)))
+#endif
+{
+    va_list args;
+    char errstr[MAX_STRING_LEN];
+
+    va_start(args, fmt);
+
+    apr_vsnprintf(errstr, MAX_STRING_LEN, fmt, args);
+
+	va_end(args);
+
+	if(modsecLogHook != NULL)
+		modsecLogHook(modsecLogObj, level, errstr);
+}
+
+
+#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER < 3
+AP_DECLARE(void) ap_log_cerror(const char *file, int line, int level,
+                             apr_status_t status, const conn_rec *r,
+                             const char *fmt, ...)
+//			    __attribute__((format(printf,6,7)))
+#else
+AP_DECLARE(void) ap_log_cerror_(const char *file, int line, int module_index,
+                                int level, apr_status_t status,
+                                const conn_rec *c, const char *fmt, ...)
+//                              __attribute__((format(printf,7,8)))
+#endif
+{
+    va_list args;
+    char errstr[MAX_STRING_LEN];
+
+    va_start(args, fmt);
+
+    apr_vsnprintf(errstr, MAX_STRING_LEN, fmt, args);
+
+	va_end(args);
+
+	if(modsecLogHook != NULL)
+		modsecLogHook(modsecLogObj, level, errstr);
+}
+
+
+#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER < 3
+AP_DECLARE(void) ap_log_rerror(const char *file, int line, int level,
+                             apr_status_t status, const request_rec *r,
+                             const char *fmt, ...)
+//			    __attribute__((format(printf,6,7)))
+#else
+AP_DECLARE(void) ap_log_rerror_(const char *file, int line, int module_index,
+                               int level, apr_status_t status,
+                               const request_rec *r, const char *fmt, ...)
 //                              __attribute__((format(printf,7,8)))
 #endif
 {
@@ -893,7 +950,11 @@ AP_DECLARE(void) ap_add_common_vars(request_rec *r)
 
 #ifndef WIN32
 
+#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER < 3
 unixd_config_rec unixd_config;
+#else
+unixd_config_rec ap_unixd_config;
+#endif
 const char *ap_server_argv0 = "nginx";
 
 #ifdef HAVE_GETPWNAM
@@ -936,13 +997,18 @@ AP_DECLARE(void) unixd_pre_config(apr_pool_t *ptemp)
 {
     apr_finfo_t wrapper;
 
+#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER < 3
     unixd_config.user_name = DEFAULT_USER;
     unixd_config.user_id = ap_uname2id(DEFAULT_USER);
     unixd_config.group_id = ap_gname2id(DEFAULT_GROUP);
-    /* unixd_config.chroot_dir = NULL; none */
-
-    /* Check for suexec */
     unixd_config.suexec_enabled = 0;
+#else
+    ap_unixd_config.user_name = DEFAULT_USER;
+    ap_unixd_config.user_id = ap_uname2id(DEFAULT_USER);
+    ap_unixd_config.group_id = ap_gname2id(DEFAULT_GROUP);
+    ap_unixd_config.suexec_enabled = 0;
+#endif
+
 /*    if ((apr_stat(&wrapper, SUEXEC_BIN,
                   APR_FINFO_NORM, ptemp)) != APR_SUCCESS) {
         return;
@@ -967,6 +1033,7 @@ static apr_lockmech_e proc_mutex_mech(apr_proc_mutex_t *pmutex)
     return APR_LOCK_DEFAULT;
 }
 
+#if AP_SERVER_MAJORVERSION_NUMBER > 1 && AP_SERVER_MINORVERSION_NUMBER < 3
 AP_DECLARE(apr_status_t) unixd_set_proc_mutex_perms(apr_proc_mutex_t *pmutex)
 {
 ////////////////
@@ -1038,5 +1105,75 @@ AP_DECLARE(apr_status_t) unixd_set_global_mutex_perms(apr_global_mutex_t *gmutex
     return unixd_set_proc_mutex_perms(gmutex);
 #endif /* APR_PROC_MUTEX_IS_GLOBAL */
 }
+#else
+AP_DECLARE(apr_status_t) ap_unixd_set_proc_mutex_perms(apr_proc_mutex_t *pmutex)
+{
+    if (ap_unixd_config.user_name == NULL)
+    {
+        unixd_pre_config(NULL);
+    }
 
+    if (!geteuid()) {
+        apr_lockmech_e mech = proc_mutex_mech(pmutex);
+
+        switch(mech) {
+#if APR_HAS_SYSVSEM_SERIALIZE
+        case APR_LOCK_SYSVSEM:
+        {
+            apr_os_proc_mutex_t ospmutex;
+#if !APR_HAVE_UNION_SEMUN
+            union semun {
+                long val;
+                struct semid_ds *buf;
+                unsigned short *array;
+            };
+#endif
+            union semun ick;
+            struct semid_ds buf;
+
+            apr_os_proc_mutex_get(&ospmutex, pmutex);
+            buf.sem_perm.uid = ap_unixd_config.user_id;
+            buf.sem_perm.gid = ap_unixd_config.group_id;
+            buf.sem_perm.mode = 0600;
+            ick.buf = &buf;
+            if (semctl(ospmutex.crossproc, 0, IPC_SET, ick) < 0) {
+                return errno;
+            }
+        }
+        break;
+#endif
+#if APR_HAS_FLOCK_SERIALIZE
+        case APR_LOCK_FLOCK:
+        {
+            const char *lockfile = apr_proc_mutex_lockfile(pmutex);
+
+            if (lockfile) {
+                if (chown(lockfile, ap_unixd_config.user_id,
+                          -1 /* no gid change */) < 0) {
+                    return errno;
+                }
+            }
+        }
+        break;
+#endif
+        default:
+            /* do nothing */
+            break;
+        }
+    }
+    return APR_SUCCESS;
+}
+
+AP_DECLARE(apr_status_t) ap_unixd_set_global_mutex_perms(apr_global_mutex_t *gmutex)
+{
+#if !APR_PROC_MUTEX_IS_GLOBAL
+    apr_os_global_mutex_t osgmutex;
+    apr_os_global_mutex_get(&osgmutex, gmutex);
+    return ap_unixd_set_proc_mutex_perms(osgmutex.proc_mutex);
+#else  /* APR_PROC_MUTEX_IS_GLOBAL */
+    /* In this case, apr_proc_mutex_t and apr_global_mutex_t are the same. */
+    return ap_unixd_set_proc_mutex_perms(gmutex);
+#endif /* APR_PROC_MUTEX_IS_GLOBAL */
+}
+#endif
 #endif

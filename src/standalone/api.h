@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -58,6 +58,7 @@ void modsecInitProcess();
 
 conn_rec *modsecNewConnection();
 void modsecProcessConnection(conn_rec *c);
+int modsecFinishConnection(conn_rec *c);
 
 request_rec *modsecNewRequest(conn_rec *connection, directory_config *config);
 
@@ -112,7 +113,16 @@ void modsecSetDropAction(int (*func)(request_rec *r));
 int modsecIsResponseBodyAccessEnabled(request_rec *r);
 int modsecIsRequestBodyAccessEnabled(request_rec *r);
 
+int modsecContextState(request_rec *r);
+
 void modsecSetConfigForIISRequestBody(request_rec *r);
+
+const char *modsecIsServerSignatureAvailale(void);
+
+#ifdef VERSION_IIS
+void modsecStatusEngineCall(void);
+void modsecReportRemoteLoadedRules(void);
+#endif
 
 #ifdef __cplusplus
 }

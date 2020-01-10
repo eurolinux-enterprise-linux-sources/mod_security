@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -38,7 +38,7 @@ static apr_status_t msre_parse_targets(msre_ruleset *ruleset, const char *text,
 static char *msre_generate_target_string(apr_pool_t *pool, msre_rule *rule);
 static msre_var *msre_create_var(msre_ruleset *ruleset, const char *name, const char *param,
     modsec_rec *msr, char **error_msg);
-static msre_action *msre_create_action(msre_engine *engine, const char *name,
+static msre_action *msre_create_action(msre_engine *engine, apr_pool_t *mp, const char *name,
     const char *param, char **error_msg);
 static apr_status_t msre_rule_process(msre_rule *rule, modsec_rec *msr);
 
@@ -769,7 +769,7 @@ static apr_status_t msre_parse_targets(msre_ruleset *ruleset, const char *text,
  * Creates msre_action instances by parsing the given string, placing
  * them into the supplied array.
  */
-static apr_status_t msre_parse_actions(msre_engine *engine, msre_actionset *actionset,
+static apr_status_t msre_parse_actions(msre_engine *engine, apr_pool_t *mp, msre_actionset *actionset,
         const char *text, char **error_msg)
 {
     const apr_array_header_t *tarr;
@@ -780,25 +780,53 @@ static apr_status_t msre_parse_actions(msre_engine *engine, msre_actionset *acti
     msre_action *action;
     int i;
 
-    if (text == NULL) return -1;
+
+    if (error_msg == NULL) {
+        return -1;
+    }
+    *error_msg = NULL;
+
+
+    if (text == NULL) {
+        *error_msg = apr_psprintf(mp, "Internal error: " \
+            "msre_parse_actions, variable text is NULL");
+        return -1;
+    }
 
     /* Extract name & value pairs first */
-    vartable = apr_table_make(engine->mp, 10);
-    if (vartable == NULL) return -1;
-    rc = msre_parse_generic(engine->mp, text, vartable, error_msg);
-    if (rc < 0) return rc;
+    vartable = apr_table_make(mp, 10);
+    if (vartable == NULL) {
+        *error_msg = apr_psprintf(mp, "Internal error: " \
+            "msre_parse_actions, failed to create vartable");
+
+        return -1;
+    }
+    rc = msre_parse_generic(mp, text, vartable, error_msg);
+    if (rc < 0) {
+        if (*error_msg == NULL)
+            *error_msg = apr_psprintf(mp, "Internal error: " \
+                "msre_parse_actions, msre_parse_generic failed. Return " \
+                "code: %d", rc);
+
+        return rc;
+    }
 
     /* Loop through the table and create actions */
     tarr = apr_table_elts(vartable);
     telts = (const apr_table_entry_t*)tarr->elts;
     for (i = 0; i < tarr->nelts; i++) {
         /* Create action. */
-        action = msre_create_action(engine, telts[i].key, telts[i].val, error_msg);
-        if (action == NULL) return -1;
+        action = msre_create_action(engine, mp, telts[i].key, telts[i].val, error_msg);
+        if (action == NULL) {
+            if (*error_msg == NULL)
+                *error_msg = apr_psprintf(mp, "Internal error: " \
+                    "msre_parse_actions, msre_create_action failed.");
+            return -1;
+        }
 
         /* Initialise action (option). */
         if (action->metadata->init != NULL) {
-            action->metadata->init(engine, actionset, action);
+            action->metadata->init(engine, mp, actionset, action);
         }
 
         msre_actionset_action_add(actionset, action);
@@ -867,14 +895,14 @@ msre_var *msre_create_var_ex(apr_pool_t *pool, msre_engine *engine, const char *
     /* Resolve variable */
     var->metadata = msre_resolve_var(engine, var->name);
     if (var->metadata == NULL) {
-        *error_msg = apr_psprintf(engine->mp, "Unknown variable: %s", name);
+        *error_msg = apr_psprintf(pool, "Unknown variable: %s", name);
         return NULL;
     }
 
     /* The counting operator "&" can only be used against collections. */
     if (var->is_counting) {
         if (var->metadata->type == VAR_SIMPLE) {
-            *error_msg = apr_psprintf(engine->mp, "The & modificator does not apply to "
+            *error_msg = apr_psprintf(pool, "The & modificator does not apply to "
                     "non-collection variables.");
             return NULL;
         }
@@ -883,7 +911,7 @@ msre_var *msre_create_var_ex(apr_pool_t *pool, msre_engine *engine, const char *
     /* Check the parameter. */
     if (varparam == NULL) {
         if (var->metadata->argc_min > 0) {
-            *error_msg = apr_psprintf(engine->mp, "Missing mandatory parameter for variable %s.",
+            *error_msg = apr_psprintf(pool, "Missing mandatory parameter for variable %s.",
                     name);
             return NULL;
         }
@@ -891,7 +919,7 @@ msre_var *msre_create_var_ex(apr_pool_t *pool, msre_engine *engine, const char *
 
         /* Do we allow a parameter? */
         if (var->metadata->argc_max == 0) {
-            *error_msg = apr_psprintf(engine->mp, "Variable %s does not support parameters.",
+            *error_msg = apr_psprintf(pool, "Variable %s does not support parameters.",
                     name);
             return NULL;
         }
@@ -912,7 +940,7 @@ msre_var *msre_create_var_ex(apr_pool_t *pool, msre_engine *engine, const char *
 static msre_var *msre_create_var(msre_ruleset *ruleset, const char *name, const char *param,
         modsec_rec *msr, char **error_msg)
 {
-    msre_var *var = msre_create_var_ex(ruleset->engine->mp, ruleset->engine, name, param, msr, error_msg);
+    msre_var *var = msre_create_var_ex(ruleset->mp, ruleset->engine, name, param, msr, error_msg);
     if (var == NULL) return NULL;
 
     /* Validate & initialise variable */
@@ -929,25 +957,36 @@ static msre_var *msre_create_var(msre_ruleset *ruleset, const char *name, const 
 /**
  * Creates a new action instance given its name and an (optional) parameter.
  */
-msre_action *msre_create_action(msre_engine *engine, const char *name, const char *param,
+msre_action *msre_create_action(msre_engine *engine, apr_pool_t *mp, const char *name, const char *param,
         char **error_msg)
 {
-    msre_action *action = apr_pcalloc(engine->mp, sizeof(msre_action));
-    if (action == NULL) return NULL;
+    msre_action *action = NULL;
 
-    if (error_msg == NULL) return NULL;
+    if (error_msg == NULL) {
+        return NULL;
+    }
     *error_msg = NULL;
+
+
+    action = apr_pcalloc(mp, sizeof(msre_action));
+
+    if (action == NULL) {
+        *error_msg = apr_psprintf(mp, "Internal error: " \
+            "msre_create_action, not able to allocate action");
+
+        return NULL;
+    }
 
     /* Resolve action */
     action->metadata = msre_resolve_action(engine, name);
     if (action->metadata == NULL) {
-        *error_msg = apr_psprintf(engine->mp, "Unknown action: %s", name);
+        *error_msg = apr_psprintf(mp, "Unknown action: %s", name);
         return NULL;
     }
 
     if (param == NULL) { /* Parameter not present */
         if (action->metadata->argc_min > 0) {
-            *error_msg = apr_psprintf(engine->mp, "Missing mandatory parameter for action %s",
+            *error_msg = apr_psprintf(mp, "Missing mandatory parameter for action %s",
                     name);
             return NULL;
         }
@@ -955,14 +994,14 @@ msre_action *msre_create_action(msre_engine *engine, const char *name, const cha
 
         /* Should we allow the parameter? */
         if (action->metadata->argc_max == 0) {
-            *error_msg = apr_psprintf(engine->mp, "Extra parameter provided to action %s", name);
+            *error_msg = apr_psprintf(mp, "Extra parameter provided to action %s", name);
             return NULL;
         }
 
         /* Handle +/- modificators */
         if ((param[0] == '+')||(param[0] == '-')) {
             if (action->metadata->allow_param_plusminus == 0) {
-                *error_msg = apr_psprintf(engine->mp,
+                *error_msg = apr_psprintf(mp,
                         "Action %s does not allow +/- modificators.", name);
                 return NULL;
             }
@@ -982,7 +1021,7 @@ msre_action *msre_create_action(msre_engine *engine, const char *name, const cha
 
         /* Validate parameter */
         if (action->metadata->validate != NULL) {
-            *error_msg = action->metadata->validate(engine, action);
+            *error_msg = action->metadata->validate(engine, mp, action);
             if (*error_msg != NULL) return NULL;
         }
     }
@@ -1125,15 +1164,32 @@ int msre_parse_generic(apr_pool_t *mp, const char *text, apr_table_t *vartable,
  * Creates an actionset instance and (as an option) populates it by
  * parsing the given string which contains a list of actions.
  */
-msre_actionset *msre_actionset_create(msre_engine *engine, const char *text,
+msre_actionset *msre_actionset_create(msre_engine *engine, apr_pool_t *mp, const char *text,
         char **error_msg)
 {
-    msre_actionset *actionset = (msre_actionset *)apr_pcalloc(engine->mp,
-            sizeof(msre_actionset));
-    if (actionset == NULL) return NULL;
+    msre_actionset *actionset = NULL;
 
-    actionset->actions = apr_table_make(engine->mp, 25);
-    if (actionset->actions == NULL) return NULL;
+    if (error_msg == NULL) {
+        return NULL;
+    }
+
+    *error_msg = NULL;
+
+    actionset = (msre_actionset *)apr_pcalloc(mp,
+            sizeof(msre_actionset));
+
+    if (actionset == NULL) {
+        *error_msg = apr_psprintf(mp, "Internal error: " \
+                "msre_actionset_create, not able to allocate msre_actionset");
+        return NULL;
+    }
+
+    actionset->actions = apr_table_make(mp, 25);
+    if (actionset->actions == NULL) {
+        *error_msg = apr_psprintf(mp, "Internal error: " \
+                "msre_actionset_create, not able to create actions table");
+        return NULL;
+    }
 
     /* Metadata */
     actionset->id = NOT_SET_P;
@@ -1169,7 +1225,12 @@ msre_actionset *msre_actionset_create(msre_engine *engine, const char *text,
 
     /* Parse the list of actions, if it's present */
     if (text != NULL) {
-        if (msre_parse_actions(engine, actionset, text, error_msg) < 0) {
+        int ret = msre_parse_actions(engine, mp, actionset, text, error_msg);
+        if (ret < 0) {
+            if (*error_msg == NULL) 
+                *error_msg = apr_psprintf(mp, "Internal error: " \
+                        "msre_actionset_create, msre_parse_actions failed " \
+                        "without further information. Return code: %d", ret);
             return NULL;
         }
     }
@@ -1194,7 +1255,7 @@ static msre_actionset *msre_actionset_copy(apr_pool_t *mp, msre_actionset *orig)
 /**
  * Merges two actionsets into one.
  */
-msre_actionset *msre_actionset_merge(msre_engine *engine, msre_actionset *parent,
+msre_actionset *msre_actionset_merge(msre_engine *engine, apr_pool_t *mp, msre_actionset *parent,
         msre_actionset *child, int inherit_by_default)
 {
     msre_actionset *merged = NULL;
@@ -1204,11 +1265,11 @@ msre_actionset *msre_actionset_merge(msre_engine *engine, msre_actionset *parent
 
     if (inherit_by_default == 0) {
         /* There is nothing to merge in this case. */
-        return msre_actionset_copy(engine->mp, child);
+	    return msre_actionset_copy(mp, child);
     }
 
     /* Start with a copy of the parent configuration. */
-    merged = msre_actionset_copy(engine->mp, parent);
+    merged = msre_actionset_copy(mp, parent);
     if (merged == NULL) return NULL;
 
     if (child == NULL) {
@@ -1271,6 +1332,7 @@ msre_actionset *msre_actionset_merge(msre_engine *engine, msre_actionset *parent
 msre_actionset *msre_actionset_create_default(msre_engine *engine) {
     char  *my_error_msg = NULL;
     return msre_actionset_create(engine,
+            engine->mp,
             "phase:2,log,auditlog,pass",
             &my_error_msg);
 }
@@ -1279,6 +1341,10 @@ msre_actionset *msre_actionset_create_default(msre_engine *engine) {
  * Sets the default values for the hard-coded actionset configuration.
  */
 void msre_actionset_set_defaults(msre_actionset *actionset) {
+
+    if (actionset == NULL) {
+        return;
+    }
     /* Metadata */
     if (actionset->id == NOT_SET_P) actionset->id = NULL;
     if (actionset->rev == NOT_SET_P) actionset->rev = NULL;
@@ -1823,8 +1889,17 @@ static apr_status_t msre_ruleset_process_phase_(msre_ruleset *ruleset, modsec_re
             }
         }
         else if (rc < 0) {
-            msr_log(msr, 1, "Rule processing failed.");
-
+            const char *id = "";
+            const char *msg = "";
+            if (rule->actionset) {
+                if (rule->actionset->id) {
+                    id = rule->actionset->id;
+                }
+                if (rule->actionset->msg) {
+                    msg = rule->actionset->msg;
+                }
+            }
+            msr_log(msr, 1, "Rule processing failed (id=%s, msg=%s).", id, msg);
 
             if (msr->txcfg->reqintercept_oe == 1)   {
                 apr_table_clear(msr->matched_vars);
@@ -1854,7 +1929,17 @@ static apr_status_t msre_ruleset_process_phase_(msre_ruleset *ruleset, modsec_re
             }
         }
         else {
-            msr_log(msr, 1, "Rule processing failed with unknown return code: %d.", rc);
+            const char *id = "";
+            const char *msg = "";
+            if (rule->actionset) {
+                if (rule->actionset->id) {
+                    id = rule->actionset->id;
+                }
+                if (rule->actionset->msg) {
+                    msg = rule->actionset->msg;
+                }
+            }
+            msr_log(msr, 1, "Rule processing failed with unknown return code: %d (id=%s, msg=%s).", rc, id, msg);
             apr_table_clear(msr->matched_vars);
             return -1;
         }
@@ -2128,10 +2213,12 @@ char *msre_format_metadata(modsec_rec *msr, msre_actionset *actionset) {
 
     if (actionset == NULL) return "";
 
+#ifndef LOG_NO_FILENAME
     if ((actionset->rule != NULL) && (actionset->rule->filename != NULL)) {
         fn = apr_psprintf(msr->mp, " [file \"%s\"] [line \"%d\"]",
                 actionset->rule->filename, actionset->rule->line_num);
     }
+#endif
     if (actionset->id != NULL) {
         id = apr_psprintf(msr->mp, " [id \"%s\"]",
                 log_escape(msr->mp, actionset->id));
@@ -2342,7 +2429,7 @@ msre_rule *msre_rule_create(msre_ruleset *ruleset, int type,
     /* Parse actions */
     if (actions != NULL) {
         /* Create per-rule actionset */
-        rule->actionset = msre_actionset_create(ruleset->engine, actions, &my_error_msg);
+        rule->actionset = msre_actionset_create(ruleset->engine, ruleset->mp, actions, &my_error_msg);
         if (rule->actionset == NULL) {
             *error_msg = apr_psprintf(ruleset->mp, "Error parsing actions: %s", my_error_msg);
             return NULL;
@@ -2386,7 +2473,7 @@ msre_rule *msre_rule_lua_create(msre_ruleset *ruleset,
     /* Parse actions */
     if (actions != NULL) {
         /* Create per-rule actionset */
-        rule->actionset = msre_actionset_create(ruleset->engine, actions, &my_error_msg);
+        rule->actionset = msre_actionset_create(ruleset->engine, ruleset->mp, actions, &my_error_msg);
         if (rule->actionset == NULL) {
             *error_msg = apr_psprintf(ruleset->mp, "Error parsing actions: %s", my_error_msg);
             return NULL;
@@ -2445,6 +2532,11 @@ static void msre_perform_disruptive_actions(modsec_rec *msr, msre_rule *rule,
             if (action->metadata->execute != NULL) {
                 action->metadata->execute(msr, mptmp, rule, action);
             }
+        }
+    }
+    if (actionset->intercept_action_rec->metadata->type == ACTION_DISRUPTIVE) {
+        if (actionset->intercept_action_rec->metadata->execute != NULL) {
+            actionset->intercept_action_rec->metadata->execute(msr, mptmp, rule, actionset->intercept_action_rec);
         }
     }
 
@@ -2604,12 +2696,16 @@ static int execute_operator(msre_var *var, msre_rule *rule, modsec_rec *msr,
             rt_time = apr_table_get(msr->perf_rules, rule->actionset->id);
             if(rt_time == NULL) {
                 rt_time = apr_psprintf(msr->mp, "%" APR_TIME_T_FMT, (t1 - time_before_op));
-                apr_table_setn(msr->perf_rules, rule->actionset->id, rt_time);
+                rule_time = (apr_time_t)atoi(rt_time);
+                if(rule_time >= msr->txcfg->max_rule_time)
+                    apr_table_setn(msr->perf_rules, rule->actionset->id, rt_time);
             } else  {
                 rule_time = (apr_time_t)atoi(rt_time);
                 rule_time += (t1 - time_before_op);
-                rt_time = apr_psprintf(msr->mp, "%" APR_TIME_T_FMT, rule_time);
-                apr_table_setn(msr->perf_rules, rule->actionset->id, rt_time);
+                if(rule_time >= msr->txcfg->max_rule_time)  {
+                    rt_time = apr_psprintf(msr->mp, "%" APR_TIME_T_FMT, rule_time);
+                    apr_table_setn(msr->perf_rules, rule->actionset->id, rt_time);
+                }
             }
         }
     }
@@ -2776,7 +2872,10 @@ static apr_status_t msre_rule_process_normal(msre_rule *rule, modsec_rec *msr) {
     arr = apr_table_elts(tartab);
     te = (apr_table_entry_t *)arr->elts;
     for (i = 0; i < arr->nelts; i++) {
+        /* Variable was modified by *any* transformation */
         int changed;
+        /* Variable was modified by *last applied* transformation (needed by multimatch) */
+        int tfnchanged;
         int usecache = 0;
         apr_table_t *cachetab = NULL;
         apr_time_t time_before_trans = 0;
@@ -2899,8 +2998,8 @@ static apr_status_t msre_rule_process_normal(msre_rule *rule, modsec_rec *msr) {
             apr_table_t *normtab;
             const char *lastvarval = NULL;
             apr_size_t lastvarlen = 0;
-            int tfnchanged = 0;
 
+            tfnchanged = 0;
             changed = 0;
             normtab = apr_table_make(mptmp, 10);
             if (normtab == NULL) return -1;
@@ -3182,7 +3281,7 @@ static apr_status_t msre_rule_process_normal(msre_rule *rule, modsec_rec *msr) {
          * or if it is and we need to process the result of the
          * last transformation.
          */
-        if (!multi_match || changed) {
+        if (!multi_match || tfnchanged) {
             invocations++;
 
             #if defined(PERFORMANCE_MEASUREMENT)

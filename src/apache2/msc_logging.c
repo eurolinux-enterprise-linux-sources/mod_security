@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -24,6 +24,11 @@
 
 #include "apr_version.h"
 #include <libxml/xmlversion.h>
+
+#ifdef WITH_YAJL
+#include <yajl/yajl_gen.h>
+#include "msc_logging_json.h"
+#endif
 
 /**
  * Write the supplied data to the audit log (if the FD is ready), update
@@ -49,16 +54,24 @@ static int sec_auditlog_write(modsec_rec *msr, const char *data, unsigned int le
     /* Write data to file. */
     rc = apr_file_write_full(msr->new_auditlog_fd, data, nbytes, &nbytes_written);
     if (rc != APR_SUCCESS) {
+        char errstr[1024];
+
         msr_log(msr, 1, "Audit log: Failed writing (requested %" APR_SIZE_T_FMT
-            " bytes, written %" APR_SIZE_T_FMT ")", nbytes, nbytes_written);
+            " bytes, written %" APR_SIZE_T_FMT "): %s", nbytes, nbytes_written,
+            apr_strerror(rc, errstr, sizeof(errstr)));
+
+        /* Concurrent log format: don't leak file handle. */
+        if (msr->txcfg->auditlog_type == AUDITLOG_CONCURRENT) {
+            apr_file_close(msr->new_auditlog_fd);
+        }
 
         /* Set to NULL to prevent more than one error message on
          * out-of-disk-space events and to prevent further attempts
          * to write to the same file in this request.
          *
-         * Note that, as we opened the file through the pool mechanism of
-         * the APR, we do not need to close the file here. It will be closed
-         * automatically at the end of the request.
+         * Serial log format: Note that, as we opened the file through the
+         * pool mechanism of the APR, we do not need to close the file
+         * here. It will be closed automatically at the end of the request.
          */
         msr->new_auditlog_fd = NULL;
 
@@ -373,6 +386,40 @@ static void sec_auditlog_write_producer_header(modsec_rec *msr) {
     sec_auditlog_write(msr, ".\n", 2);
 }
 
+#ifdef WITH_YAJL
+/**
+ * Ouput the Producer header into a JSON generator
+ */
+static void sec_auditlog_write_producer_header_json(modsec_rec *msr, yajl_gen g) {
+    char **signatures = NULL;
+    int i;
+
+    // this is written no matter what
+    yajl_string(g, "producer");
+
+    /* Try to write verything in one go. */
+    if (msr->txcfg->component_signatures->nelts == 0) {
+        yajl_string(g, MODSEC_MODULE_NAME_FULL);
+
+        return;
+    }
+
+    // we'll need an array if there are component signatures
+    yajl_gen_array_open(g);
+
+    /* Start with the ModSecurity signature. */
+    yajl_string(g, MODSEC_MODULE_NAME_FULL);
+
+    /* Then loop through the components and output individual signatures. */
+    signatures = (char **)msr->txcfg->component_signatures->elts;
+    for(i = 0; i < msr->txcfg->component_signatures->nelts; i++) {
+        yajl_string(g, (char *)signatures[i]);
+    }
+
+    yajl_gen_array_close(g); // array for producers is finished
+}
+#endif
+
 /*
 * \brief This function will returns the next chain node
 *
@@ -472,10 +519,1008 @@ static int chained_is_matched(modsec_rec *msr, const msre_rule *next_rule) {
     return 0;
 }
 
+#ifdef WITH_YAJL
 /**
- * Produce an audit log entry.
+ * Write detailed information about performance metrics into a JSON generator
  */
-void sec_audit_logger(modsec_rec *msr) {
+static void format_performance_variables_json(modsec_rec *msr, yajl_gen g) {
+    yajl_string(g, "stopwatch");
+    yajl_gen_map_open(g);
+
+    yajl_kv_int(g, "p1", msr->time_phase1);
+    yajl_kv_int(g, "p2", msr->time_phase2);
+    yajl_kv_int(g, "p3", msr->time_phase3);
+    yajl_kv_int(g, "p4", msr->time_phase4);
+    yajl_kv_int(g, "p5", msr->time_phase5);
+    yajl_kv_int(g, "sr", msr->time_storage_read);
+    yajl_kv_int(g, "sw", msr->time_storage_write);
+    yajl_kv_int(g, "l", msr->time_logging);
+    yajl_kv_int(g, "gc", msr->time_gc);
+
+    yajl_gen_map_close(g);
+}
+
+/**
+ * Write detailed information about a rule and its actionset into a JSON generator
+ */
+static void write_rule_json(modsec_rec *msr, const msre_rule *rule, yajl_gen g) {
+    const apr_array_header_t *tarr;
+    const apr_table_entry_t *telts;
+    int been_opened = 0;
+    int k;
+
+    yajl_gen_map_open(g);
+
+    yajl_string(g, "actionset");
+    yajl_gen_map_open(g);
+    if (rule->actionset->id) {
+        yajl_kv_string(g, "id", log_escape(msr->mp, rule->actionset->id));
+    }
+    if (rule->actionset->rev) {
+        yajl_kv_string(g, "rev", log_escape(msr->mp, rule->actionset->rev));
+    }
+    if (rule->actionset->version) {
+        yajl_kv_string(g, "version", log_escape(msr->mp, rule->actionset->version));
+    }
+    if (rule->actionset->severity != NOT_SET) {
+        yajl_kv_int(g, "severity", rule->actionset->severity);
+    }
+    if (rule->actionset->accuracy != NOT_SET) {
+        yajl_kv_int(g, "accuracy", rule->actionset->accuracy);
+    }
+    if (rule->actionset->maturity != NOT_SET) {
+        yajl_kv_int(g, "maturity", rule->actionset->maturity);
+    }
+    if (rule->actionset->phase != NOT_SET) {
+        yajl_kv_int(g, "phase", rule->actionset->phase);
+    }
+    yajl_kv_bool(g, "is_chained", rule->actionset->is_chained || (rule->chain_starter != NULL));
+    if (rule->actionset->is_chained && (rule->chain_starter == NULL)) {
+        yajl_kv_bool(g, "chain_starter", 1);
+    }
+
+    // tags, lazily opened
+    tarr = apr_table_elts(rule->actionset->actions);
+    telts = (const apr_table_entry_t*)tarr->elts;
+    for (k = 0; k < tarr->nelts; k++) {
+        msre_action *action = (msre_action *)telts[k].val;
+        if (strcmp(telts[k].key, "tag") == 0) {
+            msc_string *var = NULL;
+            if (been_opened == 0) {
+                yajl_string(g, "tags");
+                yajl_gen_array_open(g);
+                been_opened = 1;
+            }
+
+            // expand variables in the tag
+            var = (msc_string *)apr_pcalloc(msr->mp, sizeof(msc_string));
+            var->value = (char *)action->param;
+            var->value_len = strlen(action->param);
+            expand_macros(msr, var, NULL, msr->mp);
+
+            yajl_string(g, log_escape(msr->mp, var->value));
+        }
+    }
+
+    if (been_opened == 1) {
+        yajl_gen_array_close(g);
+    }
+
+    yajl_gen_map_close(g);
+
+    yajl_string(g, "operator");
+    yajl_gen_map_open(g);
+    yajl_kv_string(g, "operator", rule->op_name);
+    yajl_kv_string(g, "operator_param", rule->op_param);
+    yajl_kv_string(g, "target", rule->p1);
+    yajl_kv_bool(g, "negated", rule->op_negated);
+    yajl_gen_map_close(g);
+
+    yajl_string(g, "config");
+    yajl_gen_map_open(g);
+    yajl_kv_string(g, "filename", rule->filename);
+    yajl_kv_int(g, "line_num", rule->line_num);
+    yajl_gen_map_close(g);
+
+    yajl_kv_string(g, "unparsed", rule->unparsed);
+    yajl_kv_bool(g, "is_matched", chained_is_matched(msr, rule));
+
+    yajl_gen_map_close(g);
+}
+
+/*
+ * Produce an audit log entry in JSON format.
+ */
+void sec_audit_logger_json(modsec_rec *msr) {
+    const apr_array_header_t *arr = NULL;
+    apr_table_entry_t *te = NULL;
+    const apr_array_header_t *tarr_pattern = NULL;
+    const apr_table_entry_t *telts_pattern = NULL;
+    char *str1 = NULL, *str2 = NULL, *text = NULL;
+    const msre_rule *rule = NULL, *next_rule = NULL;
+    apr_size_t nbytes, nbytes_written;
+    unsigned char md5hash[APR_MD5_DIGESTSIZE];
+    int was_limited = 0;
+    int present = 0;
+    int wrote_response_body = 0;
+    char *entry_filename, *entry_basename;
+    apr_status_t rc;
+    int i, limit, k, sanitized_partial, j;
+    char *buf = NULL, *pat = NULL;
+    msc_parm *mparm = NULL;
+    int arg_min, arg_max, sanitize_matched;
+    yajl_gen g;
+    int been_opened = 0; // helper flag for conditionally opening maps
+    const unsigned char *final_buf;
+    size_t len;
+
+
+    /* Return silently if we don't have a request line. This
+     * means we will not be logging request timeouts.
+     */
+    if (msr->request_line == NULL) {
+        msr_log(msr, 4, "Audit log: Skipping request whose request_line is null.");
+        return;
+    }
+
+    /* Also return silently if we don't have a file descriptor. */
+    if (msr->txcfg->auditlog_fd == NULL) {
+        msr_log(msr, 4, "Audit log: Skipping request since there is nowhere to write to.");
+        return;
+    }
+
+    if (msr->txcfg->auditlog_type != AUDITLOG_CONCURRENT) {
+        /* Serial logging - we already have an open file
+         * descriptor to write to.
+         */
+        msr->new_auditlog_fd = msr->txcfg->auditlog_fd;
+    } else {
+        /* Concurrent logging - we need to create a brand
+         * new file for this request.
+         */
+        apr_md5_init(&msr->new_auditlog_md5ctx);
+
+        msr->new_auditlog_filename = construct_auditlog_filename(msr->mp, msr->txid);
+        if (msr->new_auditlog_filename == NULL) return;
+
+        /* The audit log storage directory should be explicitly
+         * defined. But if it isn't try to write to the same
+         * directory where the index file is placed. Of course,
+         * it is *very* bad practice to allow the Apache user
+         * to write to the same directory where a root user is
+         * writing to but it's not us that's causing the problem
+         * and there isn't anything we can do about that.
+         *
+         * ENH Actually there is something we can do! We will make
+         * SecAuditStorageDir mandatory, ask the user to explicitly
+         * define the storage location *and* refuse to work if the
+         * index and the storage location are in the same folder.
+         */
+        if (msr->txcfg->auditlog_storage_dir == NULL) {
+            entry_filename = file_dirname(msr->mp, msr->txcfg->auditlog_name);
+        }
+        else {
+            entry_filename = msr->txcfg->auditlog_storage_dir;
+        }
+        if (entry_filename == NULL) return;
+
+        entry_filename = apr_psprintf(msr->mp, "%s%s", entry_filename, msr->new_auditlog_filename);
+        if (entry_filename == NULL) return;
+        entry_basename = file_dirname(msr->mp, entry_filename);
+        if (entry_basename == NULL) return;
+
+        /* IMP1 Surely it would be more efficient to check the folders for
+         * the audit log repository base path in the configuration phase, to reduce
+         * the work we do on every request. Also, since our path depends on time,
+         * we could cache the time we last checked and don't check if we know
+         * the folder is there.
+         */
+        rc = apr_dir_make_recursive(entry_basename, msr->txcfg->auditlog_dirperms, msr->mp);
+        if ((rc != APR_SUCCESS) && (rc != APR_EEXIST)) {
+            msr_log(msr, 1, "Audit log: Failed to create subdirectories: %s (%s)",
+                entry_basename, get_apr_error(msr->mp, rc));
+            return;
+        }
+
+        rc = apr_file_open(&msr->new_auditlog_fd, entry_filename,
+            APR_WRITE | APR_TRUNCATE | APR_CREATE | APR_BINARY | APR_FILE_NOCLEANUP,
+            msr->txcfg->auditlog_fileperms, msr->mp);
+        if (rc != APR_SUCCESS) {
+            msr_log(msr, 1, "Audit log: Failed to create file: %s (%s)",
+                entry_filename, get_apr_error(msr->mp, rc));
+            return;
+        }
+    }
+
+    /* Lock the mutex, but only if we are using serial format. */
+    if (msr->txcfg->auditlog_type != AUDITLOG_CONCURRENT) {
+        rc = apr_global_mutex_lock(msr->modsecurity->auditlog_lock);
+        if (rc != APR_SUCCESS) {
+            msr_log(msr, 1, "Audit log: Failed to lock global mutex: %s",
+                get_apr_error(msr->mp, rc));
+        }
+    }
+
+    /**
+     * allocate the buffer for the JSON generator
+     * passing null will force yajl to use malloc/realloc/free
+     * need to perf test using APR routines
+     */
+    g = yajl_gen_alloc(NULL);
+
+    /**
+     * don't pretty print JSON
+     * this is harder to eyeball but much easier to parse programmatically
+     */
+    yajl_gen_config(g, yajl_gen_beautify, 0);
+
+    yajl_gen_map_open(g); // IT BEGINS
+
+    /* AUDITLOG_PART_HEADER */
+    yajl_string(g, "transaction");
+    yajl_gen_map_open(g); // transaction top-level key
+
+    yajl_kv_string(g, "time", current_logtime(msr->mp));
+    yajl_kv_string(g, "transaction_id", msr->txid);
+    yajl_kv_string(g, "remote_address", msr->remote_addr);
+    yajl_kv_int(g, "remote_port", (int)msr->remote_port); // msr->remote_port is unsigned, yajl wants signed
+    yajl_kv_string(g, "local_address", msr->local_addr);
+    yajl_kv_int(g, "local_port", (int)msr->local_port);
+
+    yajl_gen_map_close(g); // transaction top-level key is finished
+
+    yajl_string(g, "request");
+    yajl_gen_map_open(g); // request top-level key
+
+    /* AUDITLOG_PART_REQUEST_HEADERS */
+
+    if (strchr(msr->txcfg->auditlog_parts, AUDITLOG_PART_REQUEST_HEADERS) != NULL) {
+        sanitize_request_line(msr);
+        yajl_kv_string(g, "request_line", msr->request_line);
+
+        yajl_string(g, "headers");
+        yajl_gen_map_open(g); // separate map for request headers
+
+        arr = apr_table_elts(msr->request_headers);
+        te = (apr_table_entry_t *)arr->elts;
+
+        tarr_pattern = apr_table_elts(msr->pattern_to_sanitize);
+        telts_pattern = (const apr_table_entry_t*)tarr_pattern->elts;
+
+        for (i = 0; i < arr->nelts; i++) {
+            sanitized_partial = 0;
+            sanitize_matched = 0;
+            text = apr_psprintf(msr->mp, "%s: %s\n", te[i].key, te[i].val);
+            // write the key no matter what
+            // since sanitization only occurs on the value
+            yajl_string(g, te[i].key);
+            if (apr_table_get(msr->request_headers_to_sanitize, te[i].key) != NULL) {
+                buf = apr_psprintf(msr->mp, "%s",text+strlen(te[i].key)+2);
+                for ( k = 0; k < tarr_pattern->nelts; k++)  {
+                    if(strncmp(telts_pattern[k].key,te[i].key,strlen(te[i].key)) ==0 ) {
+                        mparm = (msc_parm *)telts_pattern[k].val;
+                        if(mparm->pad_1 == -1)
+                            sanitize_matched = 1;
+                        pat = strstr(buf,mparm->value);
+                        if (pat != NULL)    {
+                            j = strlen(mparm->value);
+                            arg_min = j;
+                            arg_max = 1;
+                            while((*pat != '\0')&&(j--)) {
+                                if(arg_max > mparm->pad_2)  {
+                                    int off = strlen(mparm->value) - arg_max;
+                                    int pos = mparm->pad_1-1;
+                                    if(off > pos)    {
+                                        *pat = '*';
+                                    }
+                                }
+                                arg_max++;
+                                arg_min--;
+                                pat++;
+                            }
+                            sanitized_partial = 1;
+                        }
+                    }
+                }
+
+                if(sanitized_partial == 1 && sanitize_matched == 0)  {
+                    yajl_string(g, buf);
+                } else {
+                    memset(buf, '*', strlen(buf)); // strlen also includes the appended newline on the header
+                    yajl_string(g, buf);
+                }
+            } else {
+            // we diverge from the original logic a bit because we always print the key
+            // at this no point sanitization had occured, so we just print the value
+                yajl_string(g, te[i].val);
+            }
+        }
+        yajl_gen_map_close(g); // request headers map is finished
+    }
+
+    /* AUDITLOG_PART_REQUEST_BODY */
+
+    /* Output this part of it was explicitly requested (C) or if it was the faked
+     * request body that was requested (I) but we have no reason to fake it (it's
+     * already in the correct format).
+     */
+    if ( (strchr(msr->txcfg->auditlog_parts, AUDITLOG_PART_REQUEST_BODY) != NULL)
+        || ( (strchr(msr->txcfg->auditlog_parts, AUDITLOG_PART_FAKE_REQUEST_BODY) != NULL)
+            && (msr->mpd == NULL) ) )
+    {
+        if (msr->msc_reqbody_read) {
+            const apr_array_header_t *tarr;
+            const apr_table_entry_t *telts;
+            apr_array_header_t *sorted_args;
+            unsigned int offset = 0, last_offset = 0;
+            msc_arg *nextarg = NULL;
+            int sanitize = 0; /* IMP1 Use constants for "sanitize" values. */
+            char *my_error_msg = NULL;
+
+            sorted_args = apr_array_make(msr->mp, 25, sizeof(const msc_arg *));
+
+            /* First we need to sort the arguments that need to be
+             * sanitized in descending order (we are using a stack structure
+             * to store then so the order will be ascending when we start
+             * popping them out). This is because we will
+             * be reading the request body sequentially and must
+             * sanitize it as we go.
+             */
+
+            for(;;) {
+                nextarg = NULL;
+
+                /* Find the next largest offset (excluding
+                 * the ones we've used up already).
+                 */
+                tarr = apr_table_elts(msr->arguments_to_sanitize);
+                telts = (const apr_table_entry_t*)tarr->elts;
+                for(i = 0; i < tarr->nelts; i++) {
+                    msc_arg *arg = (msc_arg *)telts[i].val;
+                    if (arg->origin != NULL &&
+                            strcmp(arg->origin, "BODY") != 0)
+                        continue;
+
+                    if (last_offset == 0) { /* The first time we're here. */
+                        if (arg->value_origin_offset > offset) {
+                            offset = arg->value_origin_offset;
+                            nextarg = arg;
+                        }
+                    } else { /* Not the first time. */
+                        if ((arg->value_origin_offset > offset)
+                            &&(arg->value_origin_offset < last_offset))
+                        {
+                            offset = arg->value_origin_offset;
+                            nextarg = arg;
+                        }
+                    }
+                }
+
+                /* If we don't have the next argument that means
+                 * we're done here.
+                 */
+                if (nextarg == NULL) break;
+
+                sanitize = 2; /* Means time to pop the next argument out. */
+                last_offset = offset;
+                offset = 0;
+                { /* IMP1 Fix this ugly bit here. */
+                    msc_arg **x = apr_array_push(sorted_args);
+                    *x = nextarg;
+                }
+            }
+
+            /* Now start retrieving the body chunk by chunk and
+             * sanitize data in pieces.
+             */
+
+            rc = modsecurity_request_body_retrieve_start(msr, &my_error_msg);
+            if (rc < 0) {
+                msr_log(msr, 1, "Audit log: %s", my_error_msg);
+            } else {
+                msc_data_chunk *chunk = NULL;
+                unsigned int chunk_offset = 0;
+                unsigned int sanitize_offset = 0;
+                unsigned int sanitize_length = 0;
+                yajl_string(g, "body");
+                yajl_gen_array_open(g); // use an array here because we're writing in chunks
+
+                for(;;) {
+                    rc = modsecurity_request_body_retrieve(msr, &chunk, -1, &my_error_msg);
+                    if (chunk != NULL) {
+                        /* Anything greater than 1 means we have more data to sanitize. */
+                        while (sanitize > 1) {
+                            msc_arg **arg = NULL;
+
+                            if (sanitize == 2) {
+                                /* Get the next argument from the stack. */
+                                arg = (msc_arg **)apr_array_pop(sorted_args);
+                                if (arg == NULL) sanitize = 0; /* We're done sanitising. */
+                                else {
+                                    /* Continue with sanitation to process the
+                                     * retrieved argument.
+                                     */
+                                    sanitize = 1;
+                                    sanitize_offset = (*arg)->value_origin_offset;
+                                    sanitize_length = (*arg)->value_origin_len;
+                                }
+                            }
+
+                            if (sanitize) {
+                                /* Check if the data we want to sanitize is
+                                 * stored in the current chunk.
+                                 */
+                                if (chunk_offset + chunk->length > sanitize_offset) {
+                                    unsigned int soff; /* data offset within chunk */
+                                    unsigned int len;  /* amount in this chunk to sanitize */
+
+                                    soff = sanitize_offset - chunk_offset;
+
+                                    if (soff + sanitize_length <= chunk->length) {
+                                        /* The entire argument resides in the current chunk. */
+                                        len = sanitize_length;
+                                        sanitize = 2; /* Get another parameter to sanitize. */
+                                    } else {
+                                        /* Some work to do here but we'll need to seek
+                                         * another chunk.
+                                         */
+                                        len = chunk->length - soff;
+                                        sanitize_offset += len;
+                                        sanitize_length -= len;
+                                        sanitize = 1; /* It's OK to go to the next chunk. */
+                                    }
+
+                                    /* Yes, we actually write over the original data.
+                                     * We shouldn't be needing it any more.
+                                     */
+                                    if (soff + len <= chunk->length) { /* double check */
+                                        memset((char *)chunk->data + soff, '*', len);
+                                    }
+                                }
+                            }
+                        }
+
+                        /* Write the sanitized chunk to the log
+                         * and advance to the next chunk. */
+                        yajl_string(g, chunk->data);
+                        chunk_offset += chunk->length;
+                    }
+
+                    if (rc <= 0) {
+                        break;
+                    }
+                }
+
+                yajl_gen_array_close(g); // request body chunks array is finished
+
+                if (rc < 0) {
+                    msr_log(msr, 1, "Audit log: %s", my_error_msg);
+                }
+
+                modsecurity_request_body_retrieve_end(msr);
+            }
+        }
+    }
+
+    /* AUDITLOG_PART_FAKE_REQUEST_BODY */
+
+    if (strchr(msr->txcfg->auditlog_parts, AUDITLOG_PART_FAKE_REQUEST_BODY) != NULL) {
+        if ((msr->msc_reqbody_read)&&(msr->mpd != NULL)) {
+            char *buffer = NULL;
+
+            buffer = multipart_reconstruct_urlencoded_body_sanitize(msr);
+            if (buffer == NULL) {
+                msr_log(msr, 1, "Audit log: Failed to reconstruct request body.");
+            } else {
+                yajl_kv_string(g, "fake_body", buffer);
+            }
+        }
+    }
+
+    yajl_gen_map_close(g); // request top-level key is finished
+
+    yajl_string(g, "response");
+    yajl_gen_map_open(g); // response top-level key
+
+    /* AUDITLOG_PART_A_RESPONSE_HEADERS */
+
+    if (strchr(msr->txcfg->auditlog_parts, AUDITLOG_PART_A_RESPONSE_HEADERS) != NULL) {
+
+        /* There are no response headers (or the status line) in HTTP 0.9 */
+        if (msr->response_headers_sent) {
+            yajl_kv_string(g, "protocol", msr->response_protocol);
+            // as an integer, response status is easier to parse than status_line
+            yajl_kv_int(g, "status", (int)msr->response_status);
+            yajl_string(g, "headers");
+            yajl_gen_map_open(g); // separate map for response headers
+
+            /* Output headers */
+
+            arr = apr_table_elts(msr->response_headers);
+            te = (apr_table_entry_t *)arr->elts;
+
+            tarr_pattern = apr_table_elts(msr->pattern_to_sanitize);
+            telts_pattern = (const apr_table_entry_t*)tarr_pattern->elts;
+
+            for (i = 0; i < arr->nelts; i++) {
+                sanitized_partial = 0;
+                sanitize_matched = 0;
+                text = apr_psprintf(msr->mp, "%s: %s\n", te[i].key, te[i].val);
+                // write the key no matter what
+                // since sanitization only occurs on the value
+                yajl_string(g, te[i].key);
+                if (apr_table_get(msr->response_headers_to_sanitize, te[i].key) != NULL) {
+                    buf = apr_psprintf(msr->mp, "%s",text+strlen(te[i].key)+2);
+
+                    for ( k = 0; k < tarr_pattern->nelts; k++)  {
+                        if(strncmp(telts_pattern[k].key,te[i].key,strlen(te[i].key)) ==0 ) {
+                            mparm = (msc_parm *)telts_pattern[k].val;
+                            if(mparm->pad_1 == -1)
+                                sanitize_matched = 1;
+                            pat = strstr(buf,mparm->value);
+                            if (pat != NULL)    {
+                                j = strlen(mparm->value);
+                                arg_min = j;
+                                arg_max = 1;
+                                while((*pat != '\0')&&(j--)) {
+                                    if(arg_max > mparm->pad_2)  {
+                                        int off = strlen(mparm->value) - arg_max;
+                                        int pos = mparm->pad_1-1;
+                                        if(off > pos)    {
+                                            *pat = '*';
+                                        }
+                                    }
+                                    arg_max++;
+                                    arg_min--;
+                                    pat++;
+                                }
+                                sanitized_partial = 1;
+                            }
+                        }
+                    }
+
+                    if(sanitized_partial == 1 && sanitize_matched == 0)  {
+                        yajl_string(g, buf);
+                    } else {
+                        memset(buf, '*', strlen(buf));
+                        yajl_string(g, buf);
+                    }
+                } else {
+                    // we diverge from the original logic a bit because we always print the key
+                    // at this point no sanitization had occured, so we just print the value
+                    yajl_string(g, te[i].val);
+                }
+            }
+            yajl_gen_map_close(g); // response headers map is finised
+        }
+    }
+
+    apr_table_clear(msr->pattern_to_sanitize);
+
+    /* AUDITLOG_PART_RESPONSE_BODY */
+
+    if (strchr(msr->txcfg->auditlog_parts, AUDITLOG_PART_RESPONSE_BODY) != NULL) {
+        if (msr->resbody_data != NULL) {
+            yajl_kv_string(g, "body", msr->resbody_data);
+            wrote_response_body = 1;
+        }
+    }
+
+    yajl_gen_map_close(g); // response top-level key is finished
+
+    yajl_string(g, "audit_data");
+    yajl_gen_map_open(g); // audit_data top-level key
+
+    /* AUDITLOG_PART_TRAILER */
+
+    if (strchr(msr->txcfg->auditlog_parts, AUDITLOG_PART_TRAILER) != NULL) {
+        apr_time_t now = apr_time_now();
+
+        /* Messages */
+        been_opened = 0;
+        if (msr->alerts->nelts > 0) {
+            yajl_string(g, "messages");
+            yajl_gen_array_open(g);
+            been_opened = 1;
+        }
+        for(i = 0; i < msr->alerts->nelts; i++) {
+            yajl_string(g, ((char **)msr->alerts->elts)[i]);
+        }
+        if (been_opened == 1) {
+            yajl_gen_array_close(g);
+        }
+
+        /* Apache error messages */
+        been_opened = 0;
+        if (msr->error_messages->nelts > 0) {
+            yajl_string(g, "error_messages");
+            yajl_gen_array_open(g);
+            been_opened = 1;
+        }
+        for(i = 0; i < msr->error_messages->nelts; i++) {
+            error_message_t *em = (((error_message_t **)msr->error_messages->elts)[i]);
+            yajl_string(g, format_error_log_message(msr->mp, em));
+        }
+        if (been_opened == 1) {
+            yajl_gen_array_close(g);
+        }
+
+        /* Action */
+        if (msr->was_intercepted) {
+            yajl_string(g, "action");
+            yajl_gen_map_open(g);
+            yajl_kv_bool(g, "intercepted", 1);
+            yajl_kv_int(g, "phase", msr->intercept_phase);
+            yajl_kv_string(g, "message", msr->intercept_message);
+            yajl_gen_map_close(g);
+        }
+
+        /* Apache-Handler */
+#ifdef LOG_NO_HANDLER
+        if (msr->txcfg->debuglog_level >= 9)
+#endif
+        if (msr->r->handler != NULL) {
+            yajl_kv_string(g, "handler", msr->r->handler);
+        }
+
+
+        /* Stopwatch2 */
+#ifdef DLOG_NO_STOPWATCH
+        if (msr->txcfg->debuglog_level >= 9)
+#endif
+        format_performance_variables_json(msr, g);
+
+        /* Our response body does not contain chunks */
+        /* ENH Only write this when the output was chunked. */
+        /* ENH Add info when request body was decompressed, dechunked too. */
+#ifdef LOG_NO_DECHUNK
+        if (msr->txcfg->debuglog_level >= 9)
+#endif
+        if (wrote_response_body) {
+            yajl_kv_bool(g, "response_body_dechunked", 1);
+        }
+
+#ifdef LOG_NO_SERVER_CONTEXT
+        if (msr->txcfg->debuglog_level >= 9) {
+#endif
+        sec_auditlog_write_producer_header_json(msr, g);
+
+        /* Server */
+        if (msr->server_software != NULL) {
+            yajl_kv_string(g, "server", msr->server_software);
+        }
+
+        been_opened = 0;
+        /* Sanitised arguments */
+        {
+            const apr_array_header_t *tarr;
+            const apr_table_entry_t *telts;
+
+            tarr = apr_table_elts(msr->arguments_to_sanitize);
+            telts = (const apr_table_entry_t*)tarr->elts;
+
+            if (tarr->nelts > 0) {
+                if (been_opened == 0) {
+                    yajl_string(g, "sanitized");
+                    yajl_gen_map_open(g);
+                    been_opened = 1;
+                }
+
+                yajl_string(g, "args");
+                yajl_gen_array_open(g);
+            }
+
+            for(i = 0; i < tarr->nelts; i++) {
+                msc_arg *arg = (msc_arg *)telts[i].val;
+                // yay arrays actually make it easier here
+                yajl_string(g, log_escape(msr->mp, arg->name));
+            }
+            if (tarr->nelts > 0) {
+                yajl_gen_array_close(g);
+            }
+        }
+
+        /* Sanitised request headers */
+        {
+            const apr_array_header_t *tarr;
+            const apr_table_entry_t *telts;
+
+            tarr = apr_table_elts(msr->request_headers_to_sanitize);
+            telts = (const apr_table_entry_t*)tarr->elts;
+
+            if (tarr->nelts > 0) {
+                if (been_opened == 0) {
+                    yajl_string(g, "sanitized");
+                    yajl_gen_map_open(g);
+                    been_opened = 1;
+                }
+
+                yajl_string(g, "request_headers");
+                yajl_gen_array_open(g);
+            }
+
+            for(i = 0; i < tarr->nelts; i++) {
+                yajl_string(g, log_escape(msr->mp, telts[i].key));
+            }
+            if (tarr->nelts > 0) {
+                yajl_gen_array_close(g);
+            }
+        }
+
+        /* Sanitised response headers */
+        {
+            const apr_array_header_t *tarr;
+            const apr_table_entry_t *telts;
+
+            tarr = apr_table_elts(msr->response_headers_to_sanitize);
+            telts = (const apr_table_entry_t*)tarr->elts;
+
+            if (tarr->nelts > 0) {
+                if (been_opened == 0) {
+                    yajl_string(g, "sanitized");
+                    yajl_gen_map_open(g);
+                    been_opened = 1;
+                }
+
+                yajl_string(g, "response_headers");
+                yajl_gen_array_open(g);
+            }
+
+            for(i = 0; i < tarr->nelts; i++) {
+                yajl_string(g, log_escape(msr->mp, telts[i].key));
+            }
+            if (tarr->nelts > 0) {
+                yajl_gen_array_close(g);
+            }
+        }
+
+        if (been_opened == 1) {
+            yajl_gen_map_close(g); // sanitized args map is finished
+        }
+#ifdef LOG_NO_SERVER_CONTEXT
+	}
+#endif
+
+        /* Web application info. */
+        if ( ((msr->txcfg->webappid != NULL)&&(strcmp(msr->txcfg->webappid, "default") != 0))
+            || (msr->sessionid != NULL) || (msr->userid != NULL))
+        {
+            yajl_string(g, "webapp_info");
+            yajl_gen_map_open(g);
+
+            if (msr->txcfg->webappid != NULL) {
+                yajl_kv_string(g, "id", log_escape(msr->mp, msr->txcfg->webappid));
+            }
+            if (msr->sessionid != NULL) {
+                yajl_kv_string(g, "session", log_escape(msr->mp, msr->sessionid));
+            }
+            if (msr->userid != NULL) {
+                yajl_kv_string(g, "user_id", log_escape(msr->mp, msr->userid));
+            }
+
+            yajl_gen_map_close(g);
+        }
+
+        if ( ((msr->txcfg->sensor_id != NULL)&&(strcmp(msr->txcfg->sensor_id, "default") != 0)))
+        {
+            if(msr->txcfg->sensor_id != NULL) {
+                yajl_kv_string(g, "sensor_id", log_escape(msr->mp, msr->txcfg->sensor_id));
+            }
+        }
+
+
+        if (msr->txcfg->is_enabled > 0) {
+            yajl_kv_string(g, "engine_mode", (msr->txcfg->is_enabled == 1 ? "DETECTION_ONLY" : "ENABLED"));
+        }
+
+        /* Rule performance time */
+        if(msr->txcfg->max_rule_time > 0)   {
+            const apr_array_header_t *tarr;
+            const apr_table_entry_t *telts;
+
+            tarr = apr_table_elts(msr->perf_rules);
+            telts = (const apr_table_entry_t*)tarr->elts;
+
+            if (tarr->nelts > 0) {
+                yajl_string(g, "rules_performance_info");
+                yajl_gen_map_open(g); // separate map for rule perf info
+            }
+
+            for(i = 0; i < tarr->nelts; i++) {
+                yajl_kv_string(g, log_escape(msr->mp, telts[i].key), log_escape(msr->mp, telts[i].val));
+            }
+            if (tarr->nelts > 0) {
+                yajl_gen_map_close(g); // map for rule perf info is finished
+            }
+        }
+    }
+
+    yajl_gen_map_close(g); // audit_data top-level key is finished
+
+    /* AUDITLOG_PART_UPLOADS */
+    if ((strchr(msr->txcfg->auditlog_parts, AUDITLOG_PART_UPLOADS) != NULL) && (msr->mpd != NULL)) {
+        multipart_part **parts = NULL;
+        unsigned int total_size = 0;
+        int cfiles = 0;
+
+        yajl_string(g, "uploads");
+        yajl_gen_map_open(g);
+
+        parts = (multipart_part **)msr->mpd->parts->elts;
+        yajl_string(g, "info");
+        yajl_gen_array_open(g); // separate array for upload info
+        for(cfiles = 0; cfiles < msr->mpd->parts->nelts; cfiles++) {
+            if (parts[cfiles]->type == MULTIPART_FILE) {
+                if(parts[cfiles]->filename != NULL) {
+                    yajl_gen_map_open(g);
+                    yajl_kv_int(g, "file_size", parts[cfiles]->tmp_file_size);
+                    yajl_kv_string(g, "file_name", log_escape(msr->mp, parts[cfiles]->filename));
+                    yajl_kv_string(g, "content_type", parts[cfiles]->content_type ? parts[cfiles]->content_type : "<Unknown Content-Type>");
+                    total_size += parts[cfiles]->tmp_file_size;
+                    yajl_gen_map_close(g);
+                }
+            }
+        }
+        yajl_gen_array_close(g); // array for upload info is finished
+        yajl_kv_int(g, "total", total_size);
+
+        yajl_gen_map_close(g); // uploads top-level key is finished
+    }
+
+    /* AUDITLOG_PART_MATCHEDRULES */
+
+    if (strchr(msr->txcfg->auditlog_parts, AUDITLOG_PART_MATCHEDRULES) != NULL) {
+        yajl_string(g, "matched_rules");
+        yajl_gen_array_open(g); // matched_rules top-level key
+
+        /* Matched Rules */
+
+        for(i = 0; i < msr->matched_rules->nelts; i++) {
+            rule = ((msre_rule **)msr->matched_rules->elts)[i];
+            if ((rule != NULL) && (rule->actionset != NULL) && rule->actionset->is_chained && (rule->chain_starter == NULL)) {
+                /*
+                 * create a separate map for each rule chain
+                 * this makes it a lot easier to search for partial chains
+                 */
+                yajl_gen_map_open(g); // map for this chain
+                yajl_kv_bool(g, "chain", 1);
+                yajl_string(g, "rules");
+                yajl_gen_array_open(g); // array for the rules
+
+                write_rule_json(msr, rule, g);
+                do {
+                    if (rule->ruleset != NULL)   {
+
+                        next_rule = return_chained_rule(rule,msr);
+
+                        if (next_rule != NULL)  {
+
+                            present = chained_is_matched(msr,next_rule);
+
+                            if (present == 1)   {
+                                i++;
+                            }
+                            write_rule_json(msr, next_rule, g);
+                        }
+                    }
+                    rule = next_rule;
+                } while (rule != NULL && rule->actionset != NULL && rule->actionset->is_chained);
+                yajl_gen_array_close(g);
+
+                yajl_kv_bool(g, "full_chain_match", present); // if one of the rules didnt match, present is set to 0
+                yajl_gen_map_close(g); // close the map for this chain
+            } else  {
+                yajl_gen_map_open(g);
+
+                yajl_kv_bool(g, "chain", 0);
+                yajl_string(g, "rules"); // this really should be 'rule', but we're keeping in line with other chain maps
+
+                yajl_gen_array_open(g);
+                if ((rule != NULL) && (rule->actionset != NULL) && !rule->actionset->is_chained && (rule->chain_starter == NULL)) {
+                    write_rule_json(msr, rule, g);
+                }
+                yajl_gen_array_close(g);
+
+                yajl_gen_map_close(g);
+            }
+        }
+        yajl_gen_array_close(g); // matched_rules top-level key is finished
+
+    }
+    /* AUDITLOG_PART_ENDMARKER */
+
+    /* finished building JSON */
+    yajl_gen_map_close(g); // box it up!
+
+    yajl_gen_get_buf(g, &final_buf, &len);
+    sec_auditlog_write(msr, final_buf, len);
+
+    yajl_gen_clear(g);
+    yajl_gen_free(g);
+
+    sec_auditlog_write(msr, "\n", 1);
+
+    /* Return here if we were writing to a serial log
+     * as it does not need an index file.
+     */
+    if (msr->txcfg->auditlog_type != AUDITLOG_CONCURRENT) {
+
+        /* Unlock the mutex we used to serialise access to the audit log file. */
+        rc = apr_global_mutex_unlock(msr->modsecurity->auditlog_lock);
+        if (rc != APR_SUCCESS) {
+            msr_log(msr, 1, "Audit log: Failed to unlock global mutex: %s",
+                    get_apr_error(msr->mp, rc));
+        }
+
+        return;
+    }
+
+    /* From here on only concurrent-style processing. */
+
+    /* File handle might already be closed after write failure. */
+    if (msr->new_auditlog_fd) {
+        apr_file_close(msr->new_auditlog_fd);
+    }
+
+    /* Write an entry to the index file */
+
+    /* Calculate hash of the entry. */
+    apr_md5_final(md5hash, &msr->new_auditlog_md5ctx);
+
+    str2 = apr_psprintf(msr->mp, "%s %d %d md5:%s", msr->new_auditlog_filename, 0,
+            msr->new_auditlog_size, bytes2hex(msr->mp, md5hash, 16));
+    if (str2 == NULL) return;
+
+    /* We do not want the index line to be longer than 3980 bytes. */
+    limit = 3980;
+    was_limited = 0;
+
+    /* If we are logging to a pipe we need to observe and
+     * obey the pipe atomic write limit - PIPE_BUF. For
+     * more details see the discussion in sec_guardian_logger code.
+     */
+    if (msr->txcfg->auditlog_name[0] == '|') {
+        if (PIPE_BUF < limit) {
+            limit = PIPE_BUF;
+        }
+    }
+
+    limit = limit - strlen(str2) - 5;
+    if (limit <= 0) {
+        msr_log(msr, 1, "Audit Log: Atomic PIPE write buffer too small: %d", PIPE_BUF);
+        return;
+    }
+
+    str1 = construct_log_vcombinedus_limited(msr, limit, &was_limited);
+    if (str1 == NULL) return;
+
+    if (was_limited == 0) {
+        text = apr_psprintf(msr->mp, "%s %s \n", str1, str2);
+    } else {
+        text = apr_psprintf(msr->mp, "%s %s L\n", str1, str2);
+    }
+    if (text == NULL) return;
+
+    nbytes = strlen(text);
+    if (msr->txcfg->debuglog_level >= 9) {
+        msr_log(msr, 9, "Audit Log: Writing %" APR_SIZE_T_FMT " bytes to primary concurrent index", nbytes);
+    }
+    apr_file_write_full(msr->txcfg->auditlog_fd, text, nbytes, &nbytes_written);
+
+    /* Write to the secondary audit log if we have one */
+    if (msr->txcfg->auditlog2_fd != NULL) {
+        if (msr->txcfg->debuglog_level >= 9) {
+            msr_log(msr, 9, "Audit Log: Writing %" APR_SIZE_T_FMT " bytes to secondary concurrent index", nbytes);
+        }
+        apr_file_write_full(msr->txcfg->auditlog2_fd, text, nbytes, &nbytes_written);
+    }
+}
+#endif
+
+/*
+ * Produce an audit log entry in native format.
+ */
+void sec_audit_logger_native(modsec_rec *msr) {
     const apr_array_header_t *arr = NULL;
     apr_table_entry_t *te = NULL;
     const apr_array_header_t *tarr_pattern = NULL;
@@ -583,18 +1628,16 @@ void sec_audit_logger(modsec_rec *msr) {
         }
     }
 
-    /* AUDITLOG_PART_HEADER */
 
+    /* AUDITLOG_PART_HEADER */
     text = apr_psprintf(msr->mp, "--%s-%c--\n", msr->new_auditlog_boundary, AUDITLOG_PART_HEADER);
     sec_auditlog_write(msr, text, strlen(text));
-
     /* Format: time transaction_id remote_addr remote_port local_addr local_port */
 
     text = apr_psprintf(msr->mp, "[%s] %s %s %u %s %u",
         current_logtime(msr->mp), msr->txid, msr->remote_addr, msr->remote_port,
         msr->local_addr, msr->local_port);
     sec_auditlog_write(msr, text, strlen(text));
-
 
     /* AUDITLOG_PART_REQUEST_HEADERS */
 
@@ -603,9 +1646,9 @@ void sec_audit_logger(modsec_rec *msr) {
         sec_auditlog_write(msr, text, strlen(text));
 
         sanitize_request_line(msr);
-
         sec_auditlog_write(msr, msr->request_line, strlen(msr->request_line));
         sec_auditlog_write(msr, "\n", 1);
+
 
         arr = apr_table_elts(msr->request_headers);
         te = (apr_table_entry_t *)arr->elts;
@@ -619,7 +1662,6 @@ void sec_audit_logger(modsec_rec *msr) {
             text = apr_psprintf(msr->mp, "%s: %s\n", te[i].key, te[i].val);
             if (apr_table_get(msr->request_headers_to_sanitize, te[i].key) != NULL) {
                 buf = apr_psprintf(msr->mp, "%s",text+strlen(te[i].key)+2);
-
                 for ( k = 0; k < tarr_pattern->nelts; k++)  {
                     if(strncmp(telts_pattern[k].key,te[i].key,strlen(te[i].key)) ==0 ) {
                         mparm = (msc_parm *)telts_pattern[k].val;
@@ -696,7 +1738,9 @@ void sec_audit_logger(modsec_rec *msr) {
                 telts = (const apr_table_entry_t*)tarr->elts;
                 for(i = 0; i < tarr->nelts; i++) {
                     msc_arg *arg = (msc_arg *)telts[i].val;
-                    if (strcmp(arg->origin, "BODY") != 0) continue;
+                    if (arg->origin != NULL &&
+                            strcmp(arg->origin, "BODY") != 0)
+                        continue;
 
                     if (last_offset == 0) { /* The first time we're here. */
                         if (arg->value_origin_offset > offset) {
@@ -739,7 +1783,6 @@ void sec_audit_logger(modsec_rec *msr) {
                 unsigned int chunk_offset = 0;
                 unsigned int sanitize_offset = 0;
                 unsigned int sanitize_length = 0;
-
                 text = apr_psprintf(msr->mp, "\n--%s-%c--\n", msr->new_auditlog_boundary, AUDITLOG_PART_REQUEST_BODY);
                 sec_auditlog_write(msr, text, strlen(text));
 
@@ -843,7 +1886,7 @@ void sec_audit_logger(modsec_rec *msr) {
 
         /* There are no response headers (or the status line) in HTTP 0.9 */
         if (msr->response_headers_sent) {
-            if (msr->status_line != NULL) {
+            if (msr->status_line != NULL && msr->status_line[0] != '\0') {
                 text = apr_psprintf(msr->mp, "%s %s\n", msr->response_protocol,
                         msr->status_line);
             } else {
@@ -922,7 +1965,6 @@ void sec_audit_logger(modsec_rec *msr) {
 
     if (strchr(msr->txcfg->auditlog_parts, AUDITLOG_PART_TRAILER) != NULL) {
         apr_time_t now = apr_time_now();
-
         text = apr_psprintf(msr->mp, "\n--%s-%c--\n", msr->new_auditlog_boundary, AUDITLOG_PART_TRAILER);
         sec_auditlog_write(msr, text, strlen(text));
 
@@ -947,12 +1989,18 @@ void sec_audit_logger(modsec_rec *msr) {
         }
 
         /* Apache-Handler */
-        if (msr->r->handler != NULL) {
+#ifdef LOG_NO_HANDLER
+	if (msr->txcfg->debuglog_level >= 9)
+#endif
+	if (msr->r->handler != NULL) {
             text = apr_psprintf(msr->mp, "Apache-Handler: %s\n", msr->r->handler);
             sec_auditlog_write(msr, text, strlen(text));
         }
 
         /* Stopwatch; left in for compatibility reasons */
+#ifdef DLOG_NO_STOPWATCH
+	if (msr->txcfg->debuglog_level >= 9) {
+#endif
         text = apr_psprintf(msr->mp, "Stopwatch: %" APR_TIME_T_FMT " %" APR_TIME_T_FMT " (- - -)\n",
             msr->request_time, (now - msr->request_time));
         sec_auditlog_write(msr, text, strlen(text));
@@ -963,18 +2011,26 @@ void sec_audit_logger(modsec_rec *msr) {
 
             text = apr_psprintf(msr->mp, "Stopwatch2: %" APR_TIME_T_FMT " %" APR_TIME_T_FMT
                 "; %s\n", msr->request_time, (now - msr->request_time), perf_all);
-
             sec_auditlog_write(msr, text, strlen(text));
         }
+#ifdef DLOG_NO_STOPWATCH
+        }
+#endif
 
         /* Our response body does not contain chunks */
         /* ENH Only write this when the output was chunked. */
         /* ENH Add info when request body was decompressed, dechunked too. */
+#ifdef LOG_NO_DECHUNK
+	if (msr->txcfg->debuglog_level >= 9)
+#endif
         if (wrote_response_body) {
             text = apr_psprintf(msr->mp, "Response-Body-Transformed: Dechunked\n");
             sec_auditlog_write(msr, text, strlen(text));
         }
 
+#ifdef LOG_NO_SERVER_CONTEXT
+        if (msr->txcfg->debuglog_level >= 9) {
+#endif
         sec_auditlog_write_producer_header(msr);
 
         /* Server */
@@ -1043,8 +2099,11 @@ void sec_audit_logger(modsec_rec *msr) {
                 sec_auditlog_write(msr, text, strlen(text));
             }
         }
+#ifdef LOG_NO_SERVER_CONTEXT
+	}
+#endif
 
-        /* Web application info. */
+	/* Web application info. */
         if ( ((msr->txcfg->webappid != NULL)&&(strcmp(msr->txcfg->webappid, "default") != 0))
             || (msr->sessionid != NULL) || (msr->userid != NULL))
         {
@@ -1088,7 +2147,6 @@ void sec_audit_logger(modsec_rec *msr) {
                 sec_auditlog_write(msr, text, strlen(text));
             }
         }
-
     }
 
     /* AUDITLOG_PART_UPLOADS */
@@ -1121,6 +2179,7 @@ void sec_audit_logger(modsec_rec *msr) {
         sec_auditlog_write(msr, text, strlen(text));
 
         /* Matched Rules */
+
         for(i = 0; i < msr->matched_rules->nelts; i++) {
             rule = ((msre_rule **)msr->matched_rules->elts)[i];
             if ((rule != NULL) && (rule->actionset != NULL) && rule->actionset->is_chained && (rule->chain_starter == NULL)) {
@@ -1141,7 +2200,6 @@ void sec_audit_logger(modsec_rec *msr) {
                                 text = apr_psprintf(msr->mp, "%s\n",next_rule->unparsed);
                                 i++;
                             }
-
                             sec_auditlog_write(msr, text, strlen(text));
                         }
                     }
@@ -1157,9 +2215,7 @@ void sec_audit_logger(modsec_rec *msr) {
             }
         }
     }
-
     /* AUDITLOG_PART_ENDMARKER */
-
     text = apr_psprintf(msr->mp, "\n--%s-%c--\n", msr->new_auditlog_boundary, AUDITLOG_PART_ENDMARKER);
     sec_auditlog_write(msr, text, strlen(text));
 
@@ -1181,7 +2237,10 @@ void sec_audit_logger(modsec_rec *msr) {
 
     /* From here on only concurrent-style processing. */
 
-    apr_file_close(msr->new_auditlog_fd);
+    /* File handle might already be closed after write failure. */
+    if (msr->new_auditlog_fd) {
+        apr_file_close(msr->new_auditlog_fd);
+    }
 
     /* Write an entry to the index file */
 
@@ -1235,4 +2294,19 @@ void sec_audit_logger(modsec_rec *msr) {
         }
         apr_file_write_full(msr->txcfg->auditlog2_fd, text, nbytes, &nbytes_written);
     }
+}
+
+/*
+ * Handler for audit log writers.
+ */
+void sec_audit_logger(modsec_rec *msr) {
+    #ifdef WITH_YAJL
+    if (msr->txcfg->auditlog_format == AUDITLOGFORMAT_JSON) {
+        sec_audit_logger_json(msr);
+    } else {
+    #endif
+        sec_audit_logger_native(msr);
+    #ifdef WITH_YAJL
+    }
+    #endif
 }

@@ -1,6 +1,6 @@
 /*
 * ModSecurity for Apache 2.x, http://www.modsecurity.org/
-* Copyright (c) 2004-2011 Trustwave Holdings, Inc. (http://www.trustwave.com/)
+* Copyright (c) 2004-2013 Trustwave Holdings, Inc. (http://www.trustwave.com/)
 *
 * You may not use this file except in compliance with
 * the License.  You may obtain a copy of the License at
@@ -12,6 +12,7 @@
 * directly using the email address security@modsecurity.org.
 */
 
+#include "modsecurity.h"
 #include "re.h"
 #include "msc_pcre.h"
 #include "msc_geo.h"
@@ -22,10 +23,20 @@
 #include "msc_util.h"
 #include "msc_tree.h"
 #include "msc_crypt.h"
+#include "msc_remote_rules.h"
+#include "msc_status_engine.h"
+#include <apr_sha1.h>
 
 #if APR_HAVE_ARPA_INET_H
 #include <arpa/inet.h>
 #endif
+
+#ifdef WITH_SSDEEP
+#include "fuzzy.h"
+#endif 
+
+#include "libinjection/libinjection.h"
+
 
 /**
  *
@@ -88,12 +99,8 @@ static int msre_op_nomatch_execute(modsec_rec *msr, msre_rule *rule,
 * \retval 0 On Fail
 */
 static int msre_op_ipmatch_param_init(msre_rule *rule, char **error_msg) {
-    apr_status_t rv;
-    char *str = NULL;
-    char *saved = NULL;
     char *param = NULL;
-    msre_ipmatch *current;
-    msre_ipmatch **last = &rule->ip_op;
+    int res = 0;
 
     if (error_msg == NULL)
         return -1;
@@ -102,36 +109,11 @@ static int msre_op_ipmatch_param_init(msre_rule *rule, char **error_msg) {
 
     param = apr_pstrdup(rule->ruleset->mp, rule->op_param);
 
-    str = apr_strtok(param, ",", &saved);
-    while( str != NULL)  {
-        const char *ipstr, *mask, *sep;
+    res = ip_tree_from_param(rule->ruleset->mp, param, &rule->ip_op,
+        error_msg);
 
-        /* get the IP address and mask strings */
-        sep = strchr(str, '/');
-        if (sep) {
-            ipstr = apr_pstrndup(rule->ruleset->mp, str, (sep - str) );
-            mask  = apr_pstrdup(rule->ruleset->mp, (sep + 1) );
-        }
-        else {
-            ipstr = apr_pstrdup(rule->ruleset->mp, str);
-            mask = NULL;
-        }
-        /* create a new msre_ipmatch containing a new apr_ipsubnet_t*, and add it to the linked list */
-        current = apr_pcalloc(rule->ruleset->mp, sizeof(msre_ipmatch));
-        rv = apr_ipsubnet_create(&current->ipsubnet, ipstr, mask, rule->ruleset->mp);
-        if ( rv != APR_SUCCESS ) {
-            char msgbuf[120];
-            apr_strerror(rv, msgbuf, sizeof msgbuf);
-            *error_msg = apr_pstrcat(rule->ruleset->mp, "Error: ", msgbuf, NULL);
-            return -1;
-        }
-        current->address = str;
-        current->next = NULL;
-        *last = current;
-        last = &current->next;
-
-        str = apr_strtok(NULL, ",",&saved);
-    }
+    if (res)
+        return 0;
 
     return 1;
 }
@@ -149,36 +131,35 @@ static int msre_op_ipmatch_param_init(msre_rule *rule, char **error_msg) {
 * \retval 0 On No Match
 */
 static int msre_op_ipmatch_execute(modsec_rec *msr, msre_rule *rule, msre_var *var, char **error_msg) {
-    msre_ipmatch *current = rule->ip_op;
-    apr_sockaddr_t *sa;
+    TreeRoot *rtree = NULL;
+    int res = 0;
 
     if (error_msg == NULL)
         return -1;
     else
         *error_msg = NULL;
 
-    if(current == NULL) {
+    if (rule == NULL || rule->ip_op == NULL) {
         msr_log(msr, 1, "ipMatch Internal Error: ipmatch value is null.");
         return 0;
     }
 
-    /* create an apr_sockaddr_t for the value string */
-    if ( apr_sockaddr_info_get(&sa, var->value, APR_UNSPEC, 0, 0, msr->mp) != APR_SUCCESS ) {
-        msr_log(msr, 1, "ipMatch Internal Error: Invalid ip address.");
-        return 0;
+    rtree = rule->ip_op;
+
+    res = tree_contains_ip(msr->mp, rtree, var->value, NULL, error_msg);
+
+    if (res < 0) {
+        msr_log(msr, 1, "%s", *error_msg);
+        *error_msg = NULL;
+    }
+    
+    if (res > 0) {
+        *error_msg = apr_psprintf(msr->mp, "IPmatch: \"%s\" matched at %s.", var->value, var->name);
     }
 
-    /* look through the linked list for a match */
-    while (current) {
-        if (apr_ipsubnet_test(current->ipsubnet, sa)) {
-            *error_msg = apr_psprintf(msr->mp, "IPmatch \"%s\" matched \"%s\" at %s.", var->value, current->address, var->name);
-            return 1;
-        }
-        current = current->next;
-    }
-
-   return 0;
+    return res;
 }
+
 
 /**
 * \brief Init function to ipmatchFromFile operator
@@ -190,109 +171,75 @@ static int msre_op_ipmatch_execute(modsec_rec *msr, msre_rule *rule, msre_var *v
 * \retval 0 On Fail
 */
 static int msre_op_ipmatchFromFile_param_init(msre_rule *rule, char **error_msg) {
-    char errstr[1024];
-    char buf[HUGE_STRING_LEN + 1];
     const char *rootpath = NULL;
     const char *filepath = NULL;
-    char *fn;
-    char *start;
-    char *end;
-    const char *ipfile_path;
-    int line = 0;
-    unsigned short int op_len;
-    apr_status_t rc;
-    apr_file_t *fd;
+    const char *ipfile_path = NULL;
+    char *fn = NULL;
+    int res = 0;
     TreeRoot *rtree = NULL;
-    TreeNode *tnode = NULL;
 
-    if (error_msg == NULL)
-        return -1;
-    else
-        *error_msg = NULL;
-
-    rtree = apr_palloc(rule->ruleset->mp, sizeof(TreeRoot));
-    if(rtree == NULL)   {
-        *error_msg = apr_psprintf(rule->ruleset->mp, "Failed allocating memory to TreeRoot.");
-        return 0;
-    }
-
-    memset(rtree, 0, sizeof(TreeRoot));
-
-    if ((rule->op_param == NULL)||(strlen(rule->op_param) == 0)) {
-        *error_msg = apr_psprintf(rule->ruleset->mp, "Missing parameter for operator 'ipmatchFromFile'.");
-        return 0;
-    }
-
-    rtree->ipv4_tree = CPTCreateRadixTree(rule->ruleset->mp);
-    if (rtree->ipv4_tree == NULL) {
-        *error_msg = apr_psprintf(rule->ruleset->mp, "ipmatchFromFile: Tree tree initialization failed.");
-        return 0;
-    }
-    rtree->ipv6_tree = CPTCreateRadixTree(rule->ruleset->mp);
-    if (rtree->ipv6_tree == NULL) {
-        *error_msg = apr_psprintf(rule->ruleset->mp, "ipmatchFromFile: Tree tree initialization failed.");
+    if ((rule->op_param == NULL) || (strlen(rule->op_param) == 0))
+    {
+        *error_msg = apr_psprintf(rule->ruleset->mp, "Missing parameter for " \
+            "operator 'ipmatchFromFile'.");
         return 0;
     }
 
     fn = apr_pstrdup(rule->ruleset->mp, rule->op_param);
-
-    ipfile_path = apr_pstrndup(rule->ruleset->mp, rule->filename, strlen(rule->filename) - strlen(apr_filepath_name_get(rule->filename)));
-
-    while((apr_isspace(*fn) != 0) && (*fn != '\0')) fn++;
+    while ((apr_isspace(*fn) != 0) && (*fn != '\0'))
+    {
+        fn++;
+    }
     if (*fn == '\0') {
-        *error_msg = apr_psprintf(rule->ruleset->mp, "Empty file specification for operator ipmatchFromFile \"%s\"", fn);
+        *error_msg = apr_psprintf(rule->ruleset->mp, "Empty file specification " \
+            "for operator ipmatchFromFile \"%s\"", fn);
         return 0;
     }
-
     filepath = fn;
-    if (apr_filepath_root(&rootpath, &filepath, APR_FILEPATH_TRUENAME, rule->ruleset->mp) != APR_SUCCESS) {
-        apr_filepath_merge(&fn, ipfile_path, fn, APR_FILEPATH_TRUENAME, rule->ruleset->mp);
-    }
 
-    rc = apr_file_open(&fd, fn, APR_READ | APR_BUFFERED | APR_FILE_NOCLEANUP, 0, rule->ruleset->mp);
-    if (rc != APR_SUCCESS) {
-        *error_msg = apr_psprintf(rule->ruleset->mp, "Could not open ipmatch file \"%s\": %s", fn, apr_strerror(rc, errstr, 1024));
+    if (strlen(fn) > strlen("http://") &&
+            strncmp(fn, "http://", strlen("http://")) == 0)
+    {
+        *error_msg = apr_psprintf(rule->ruleset->mp, "HTTPS address or file " \
+            "path are expected for operator ipmatchFromFile \"%s\"", fn);
         return 0;
     }
-
-    while((rc = apr_file_gets(buf, HUGE_STRING_LEN, fd)) != APR_EOF) {
-        line++;
-        if (rc != APR_SUCCESS) {
-            *error_msg = apr_psprintf(rule->ruleset->mp, "Could not read \"%s\" line %d: %s", fn, line, apr_strerror(rc, errstr, 1024));
+    else if (strlen(fn) > strlen("https://") &&
+            strncmp(fn, "https://", strlen("https://")) == 0)
+    {
+#ifdef WITH_CURL
+        res = ip_tree_from_uri(&rtree, fn, rule->ruleset->mp, error_msg);
+        if (res == -2)
+        {
+            /* Failed to download but we won't stop the webserver to start. */
+            return 1;
+        }
+        else if (res)
+        {
             return 0;
         }
-
-        op_len = strlen(buf);
-
-        start = buf;
-        while ((apr_isspace(*start) != 0) && (*start != '\0')) start++;
-        for (end = start; end != NULL || *end != '\0' || *end != '\n'; end++) {
-            if (apr_isxdigit(*end) || *end == '.' || *end == '/' || *end == ':') {
-                continue;
-            }
-            else {
-                if (*end != '\n') {
-                    *error_msg = apr_psprintf(rule->ruleset->mp, "Invalid char \"%c\" in line %d of file %s", *end, line, fn);
-                }
-                break;
-            }
+#else
+        *error_msg = apr_psprintf(rule->ruleset->mp, "ModSecurity was not " \
+            "compiled with Curl support, it cannot load: \"%s\"", fn);
+        return 0;
+#endif
+    }
+    else
+    {
+        ipfile_path = apr_pstrndup(rule->ruleset->mp, rule->filename,
+            strlen(rule->filename) - strlen(apr_filepath_name_get(rule->filename)));
+        if (apr_filepath_root(&rootpath, &filepath, APR_FILEPATH_TRUENAME,
+            rule->ruleset->mp) != APR_SUCCESS) {
+            apr_filepath_merge(&fn, ipfile_path, fn, APR_FILEPATH_TRUENAME, rule->ruleset->mp);
         }
-        *end = '\0';
 
-        if ((start == end) || (*start == '#')) continue;
-
-        if (strchr(start, ':') == NULL) {
-            tnode = TreeAddIP(start, rtree->ipv4_tree, IPV4_TREE);
-        }
-        else {
-            tnode = TreeAddIP(start, rtree->ipv6_tree, IPV6_TREE);
-        }
-        if (tnode == NULL) {
-            *error_msg = apr_psprintf(rule->ruleset->mp, "Could not add entry \"%s\" in line %d of file %s to IP list", start, line, fn);
+        res = ip_tree_from_file(&rtree, fn, rule->ruleset->mp, error_msg);
+        if (res)
+        {
+            return 0;
         }
     }
 
-    if (fd != NULL) apr_file_close(fd);
     rule->op_param_data = rtree;
     return 1;
 }
@@ -309,67 +256,49 @@ static int msre_op_ipmatchFromFile_param_init(msre_rule *rule, char **error_msg)
 * \retval 1 On Match
 * \retval 0 On No Match
 */
+static int msre_op_ipmatchFromFile_execute(modsec_rec *msr, msre_rule *rule,
+    msre_var *var, char **error_msg) {
 
-static int msre_op_ipmatchFromFile_execute(modsec_rec *msr, msre_rule *rule, msre_var *var, char **error_msg) {
     TreeRoot *rtree = (TreeRoot *)rule->op_param_data;
-    struct in_addr in;
-#if APR_HAVE_IPV6
-    struct in6_addr in6;
-#endif
+    int res = 0;
 
     if (error_msg == NULL)
         return -1;
     else
         *error_msg = NULL;
 
-    if(rtree == NULL) {
-        msr_log(msr, 1, "ipMatchFromFile Internal Error: tree value is null.");
+    if (rtree == NULL)
+    {
+        if (msr->txcfg->debuglog_level >= 6)
+        {
+            msr_log(msr, 1, "ipMatchFromFile: tree value is null.");
+        }
         return 0;
     }
 
     if (msr->txcfg->debuglog_level >= 4) {
-        msr_log(msr, 4, "IPmatchFromFile: Total tree entries: %d, ipv4 %d ipv6 %d", rtree->ipv4_tree->count+rtree->ipv6_tree->count,
+        msr_log(msr, 4, "IPmatchFromFile: Total tree entries: %d, ipv4 %d " \
+            "ipv6 %d", rtree->ipv4_tree->count+rtree->ipv6_tree->count,
             rtree->ipv4_tree->count, rtree->ipv6_tree->count);
     }
 
-    if (strchr(var->value, ':') == NULL) {
-        if (inet_pton(AF_INET, var->value, &in) <= 0) {
-            if (msr->txcfg->debuglog_level >= 9) {
-                msr_log(msr, 9, "IPmatchFromFile: bad IPv4 specification \"%s\".", var->value);
-            }
-            *error_msg = apr_psprintf(msr->mp, "IPmatchFromFile: bad IP specification \"%s\".", var->value);
-            return 0;
-        }
+    res = tree_contains_ip(msr->mp, rtree, var->value, msr,
+        error_msg);
 
-        if (CPTIpMatch(msr, (unsigned char *)&in.s_addr, rtree->ipv4_tree, IPV4_TREE) != NULL) {
-            *error_msg = apr_psprintf(msr->mp, "IPmatchFromFile \"%s\" matched at %s.", var->value, var->name);
-            return 1;
-        }
-    }
-#if APR_HAVE_IPV6
-    else {
-        if (inet_pton(AF_INET6, var->value, &in6) <= 0) {
-            if (msr->txcfg->debuglog_level >= 9) {
-                msr_log(msr, 9, "IPmatchFromFile: bad IPv6 specification \"%s\".", var->value);
-            }
-            *error_msg = apr_psprintf(msr->mp, "IPmatchFromFile: bad IP specification \"%s\".", var->value);
-            return 0;
-        }
+    if (res < 0)
+        msr_log(msr, 9, "%s", *error_msg);
 
-        if (CPTIpMatch(msr, (unsigned char *)&in6.s6_addr, rtree->ipv6_tree, IPV6_TREE) != NULL) {
-            *error_msg = apr_psprintf(msr->mp, "IPmatchFromFile \"%s\" matched at %s.", var->value, var->name);
-            return 1;
-        }
-    }
-#endif
+    if (res > 0)
+        *error_msg = apr_psprintf(msr->mp, "IPmatchFromFile: \"%s\" matched at " \
+        "%s.", var->value, var->name);
 
-    return 0;
+    return res;
 }
 
 /* rsub */
 
 static char *param_remove_escape(msre_rule *rule, char *str, int len)  {
-    char *parm = apr_palloc(rule->ruleset->mp, len);
+    char *parm = apr_pcalloc(rule->ruleset->mp, len);
     char *ret = parm;
 
     for(;*str!='\0';str++)    {
@@ -693,7 +622,7 @@ nextround:
 
         msr->of_stream_changed = 1;
 
-        strncpy(msr->stream_output_data, data, size);
+        memcpy(msr->stream_output_data, data, size);
         msr->stream_output_data[size] = '\0';
 
         var->value_len = size;
@@ -717,7 +646,7 @@ nextround:
 
         msr->if_stream_changed = 1;
 
-        strncpy(msr->stream_input_data, data, size);
+        memcpy(msr->stream_input_data, data, size);
         msr->stream_input_data[size] = '\0';
 
         var->value_len = size;
@@ -959,7 +888,7 @@ static int msre_op_validateHash_execute(modsec_rec *msr, msre_rule *rule, msre_v
 
             nlink = apr_pstrmemdup(msr->mp, target, strlen(target) - strlen(valid) - 1);
 
-            msr_log(msr, 9, "Validating URI %s size %d",nlink,strlen(nlink));
+            msr_log(msr, 9, "Validating URI %s size %zu",nlink,strlen(nlink));
 
             hash_link = do_hash_link(msr, (char *)nlink, HASH_ONLY);
 
@@ -1345,61 +1274,113 @@ static int msre_op_pmFromFile_param_init(msre_rule *rule, char **error_msg) {
 
         /* Add path of the rule filename for a relative phrase filename */
         filepath = fn;
-        if (apr_filepath_root(&rootpath, &filepath, APR_FILEPATH_TRUENAME, rule->ruleset->mp) != APR_SUCCESS) {
-            /* We are not an absolute path.  It could mean an error, but
-             * let that pass through to the open call for a better error */
-            apr_filepath_merge(&fn, rulefile_path, fn, APR_FILEPATH_TRUENAME, rule->ruleset->mp);
-        }
 
-        /* Open file and read */
-        rc = apr_file_open(&fd, fn, APR_READ | APR_BUFFERED | APR_FILE_NOCLEANUP, 0, rule->ruleset->mp);
-        if (rc != APR_SUCCESS) {
-            *error_msg = apr_psprintf(rule->ruleset->mp, "Could not open phrase file \"%s\": %s", fn, apr_strerror(rc, errstr, 1024));
+        if (strlen(fn) > strlen("http://") &&
+            strncmp(fn, "http://", strlen("http://")) == 0)
+        {
+            *error_msg = apr_psprintf(rule->ruleset->mp, "HTTPS address or " \
+                "file path are expected for operator pmFromFile \"%s\"", fn);
             return 0;
         }
+        else if (strlen(fn) > strlen("https://") &&
+            strncmp(fn, "https://", strlen("https://")) == 0)
+        {
+#ifdef WITH_CURL
+            int res = 0;
+            char *word = NULL;
+            char *brkt = NULL;
+            char *sep = "\n";
+            struct msc_curl_memory_buffer_t chunk;
 
-        #ifdef DEBUG_CONF
-        fprintf(stderr, "Loading phrase file: \"%s\"\n", fn);
-        #endif
-
-        /* Read one pattern per line skipping empty/commented */
-        for(;;) {
-            line++;
-            rc = apr_file_gets(buf, HUGE_STRING_LEN, fd);
-            if (rc == APR_EOF) break;
-            if (rc != APR_SUCCESS) {
-                *error_msg = apr_psprintf(rule->ruleset->mp, "Could not read \"%s\" line %d: %s", fn, line, apr_strerror(rc, errstr, 1024));
+            res = msc_remote_download_content(rule->ruleset->mp, fn, NULL,
+                    &chunk, error_msg);
+            if (res == -2)
+            {
+                /* If download failed but SecRemoteRulesFailAction is set to Warn. */
+                return 1;
+            }
+            else if (res < 0)
+            {
                 return 0;
             }
 
-            op_len = strlen(buf);
-            processed = apr_pstrdup(rule->ruleset->mp, parse_pm_content(buf, op_len, rule, error_msg));
+            for (word = strtok_r(chunk.memory, sep, &brkt);
+                 word;
+                 word = strtok_r(NULL, sep, &brkt))
+            {
+                /* Ignore empty lines and comments */
+                if (*word == '#') continue;
 
-            /* Trim Whitespace */
-            if(processed != NULL)
-                start = processed;
-            else
-                start = buf;
-
-            while ((apr_isspace(*start) != 0) && (*start != '\0')) start++;
-            if(processed != NULL)
-                end = processed + strlen(processed);
-            else
-                end = buf + strlen(buf);
-            if (end > start) end--;
-            while ((end > start) && (apr_isspace(*end) != 0)) end--;
-            if (end > start) {
-                *(++end) = '\0';
+                acmp_add_pattern(p, word, NULL, NULL, strlen(word));
+            }
+            msc_remote_clean_chunk(&chunk);
+#else
+            *error_msg = apr_psprintf(rule->ruleset->mp, "ModSecurity was not " \
+                "compiled with Curl support, it cannot load: \"%s\"", fn);
+            return 0;
+#endif
+        }
+        else
+        {
+            if (apr_filepath_root(&rootpath, &filepath, APR_FILEPATH_TRUENAME, rule->ruleset->mp) != APR_SUCCESS) {
+                /* We are not an absolute path.  It could mean an error, but
+                 * let that pass through to the open call for a better error */
+                apr_filepath_merge(&fn, rulefile_path, fn, APR_FILEPATH_TRUENAME, rule->ruleset->mp);
             }
 
-            /* Ignore empty lines and comments */
-            if ((start == end) || (*start == '#')) continue;
+            /* Open file and read */
+            rc = apr_file_open(&fd, fn, APR_READ | APR_BUFFERED | APR_FILE_NOCLEANUP, 0, rule->ruleset->mp);
+            if (rc != APR_SUCCESS) {
+                *error_msg = apr_psprintf(rule->ruleset->mp, "Could not open phrase file \"%s\": %s", fn, apr_strerror(rc, errstr, 1024));
+                return 0;
+            }
 
-            acmp_add_pattern(p, start, NULL, NULL, (end - start));
+            #ifdef DEBUG_CONF
+            fprintf(stderr, "Loading phrase file: \"%s\"\n", fn);
+            #endif
+
+            /* Read one pattern per line skipping empty/commented */
+            for(;;) {
+                line++;
+                rc = apr_file_gets(buf, HUGE_STRING_LEN, fd);
+                if (rc == APR_EOF) break;
+                if (rc != APR_SUCCESS) {
+                    *error_msg = apr_psprintf(rule->ruleset->mp, "Could not read \"%s\" line %d: %s", fn, line, apr_strerror(rc, errstr, 1024));
+                    return 0;
+                }
+
+                op_len = strlen(buf);
+                processed = apr_pstrdup(rule->ruleset->mp, parse_pm_content(buf, op_len, rule, error_msg));
+
+                /* Trim Whitespace */
+                if(processed != NULL)
+                    start = processed;
+                else
+                    start = buf;
+
+                while ((apr_isspace(*start) != 0) && (*start != '\0')) start++;
+                if(processed != NULL)
+                    end = processed + strlen(processed);
+                else
+                    end = buf + strlen(buf);
+                if (end > start) end--;
+                while ((end > start) && (apr_isspace(*end) != 0)) end--;
+                if (end > start) {
+                    *(++end) = '\0';
+                }
+
+                /* Ignore empty lines and comments */
+                if ((start == end) || (*start == '#')) continue;
+
+                acmp_add_pattern(p, start, NULL, NULL, (end - start));
+            }
         }
+
         fn = next;
+
+        if (fd != NULL) apr_file_close(fd);
     }
-    if (fd != NULL) apr_file_close(fd);
+
     acmp_prepare(p);
     rule->op_param_data = p;
     return 1;
@@ -1416,6 +1397,16 @@ static int msre_op_pm_execute(modsec_rec *msr, msre_rule *rule, msre_var *var, c
 
     /* Are we supposed to capture subexpressions? */
     capture = apr_table_get(rule->actionset->actions, "capture") ? 1 : 0;
+
+    if (rule->op_param_data == NULL)
+    {
+        if (msr->txcfg->debuglog_level >= 6)
+        {
+            msr_log(msr, 1, "ACMPTree is null.");
+        }
+
+        return 0;
+    }
 
     pt.parser = (ACMP *)rule->op_param_data;
     pt.ptr = NULL;
@@ -2128,6 +2119,65 @@ static int msre_op_contains_execute(modsec_rec *msr, msre_rule *rule, msre_var *
     /* No match. */
     return 0;
 }
+
+/** libinjection detectSQLi
+ *   links against files in libinjection directory
+ *  See www.client9.com/libinjection for details
+ */
+static int msre_op_detectSQLi_execute(modsec_rec *msr, msre_rule *rule, msre_var *var,
+    char **error_msg) {
+
+    char fingerprint[8];
+    int issqli;
+    int capture;
+
+    issqli = libinjection_sqli(var->value, var->value_len, fingerprint);
+    capture = apr_table_get(rule->actionset->actions, "capture") ? 1 : 0;
+
+    if (issqli) {
+        set_match_to_tx(msr, capture, fingerprint, 0);
+
+        *error_msg = apr_psprintf(msr->mp, "detected SQLi using libinjection with fingerprint '%s'",
+                                  fingerprint);
+        if (msr->txcfg->debuglog_level >= 9) {
+            msr_log(msr, 9, "ISSQL: libinjection fingerprint '%s' matched input '%s'",
+                    fingerprint,
+                    log_escape_ex(msr->mp, var->value, var->value_len));
+        }
+    } else {
+        if (msr->txcfg->debuglog_level >= 9) {
+            msr_log(msr, 9, "ISSQL: not sqli, no libinjection sqli fingerprint matched input '%s'",
+                    log_escape_ex(msr->mp, var->value, var->value_len));
+        }
+    }
+
+    return issqli;
+}
+
+/** libinjection detectXSS
+ */
+static int msre_op_detectXSS_execute(modsec_rec *msr, msre_rule *rule, msre_var *var,
+    char **error_msg) {
+
+    int is_xss;
+
+    is_xss = libinjection_xss(var->value, var->value_len);
+
+    if (is_xss) {
+        *error_msg = apr_psprintf(msr->mp, "detected XSS using libinjection.");
+
+        if (msr->txcfg->debuglog_level >= 9) {
+            msr_log(msr, 9, "IS_XSS: libinjection detected XSS.");
+        }
+    } else {
+        if (msr->txcfg->debuglog_level >= 9) {
+            msr_log(msr, 9, "IS_XSS: not XSS, libinjection was not able to find any XSS.");
+        }
+    }
+
+    return is_xss;
+}
+
 
 /* containsWord */
 
@@ -3773,6 +3823,164 @@ static int msre_op_rbl_execute(modsec_rec *msr, msre_rule *rule, msre_var *var, 
     return 0;
 }
 
+/* fuzzyHash */
+static int msre_op_fuzzy_hash_init(msre_rule *rule, char **error_msg)
+{
+#ifdef WITH_SSDEEP
+    struct fuzzy_hash_param_data *param_data;
+    struct fuzzy_hash_chunk *chunk, *t;
+    FILE *fp;
+    char *file;
+    int param_len,threshold;
+    char line[1024];
+
+    char *data = NULL;
+    char *threshold_str = NULL;
+
+    param_data = apr_palloc(rule->ruleset->mp,
+        sizeof(struct fuzzy_hash_param_data));
+
+    param_data->head = NULL;
+
+    data = apr_pstrdup(rule->ruleset->mp, rule->op_param);
+    threshold_str = data;
+#endif
+
+    if (error_msg == NULL)
+    {
+        return -1;
+    }
+
+    *error_msg = NULL;
+
+#ifdef WITH_SSDEEP
+    /* Sanity check */
+    param_len = strlen(threshold_str);
+    threshold_str = threshold_str + param_len;
+
+    if (param_len < 3)
+    {
+        goto invalid_parameters;
+    }
+
+    while (param_len - 1 > 0 && *threshold_str != ' ')
+    {
+        param_len--;
+        threshold_str--;
+    }
+
+    *threshold_str = '\0';
+    threshold_str++;
+    file = data;
+    threshold = atoi(threshold_str);
+
+    if ((file == NULL) || (is_empty_string(file)) || (threshold > 100) ||
+        (threshold < 1))
+    {
+        goto invalid_parameters;
+    }
+
+    file = resolve_relative_path(rule->ruleset->mp, rule->filename, file);
+
+    fp = fopen(file, "r");
+    if (!fp)
+    {
+        *error_msg = apr_psprintf(rule->ruleset->mp, "Not able to open file:" \
+            " %s.", file);
+        return -1;
+    }
+
+    while (read_line(line, sizeof(line), fp))
+    {
+        chunk = apr_palloc(rule->ruleset->mp,
+            sizeof(struct fuzzy_hash_chunk));
+
+        chunk->data = apr_pstrdup(rule->ruleset->mp, line);
+        chunk->next = NULL;
+
+        if (param_data->head == NULL) {
+            param_data->head = chunk;
+        } else {
+            t = param_data->head;
+
+            while (t->next) {
+                t = t->next;
+            }
+
+            t->next = chunk;
+        }
+    }
+
+    fclose(fp);
+
+    param_data->file = file;
+    param_data->threshold = threshold;
+
+    rule->op_param_data = param_data;
+#else
+    rule->op_param_data = NULL;
+
+    return 1;
+#endif
+    return 1;
+
+invalid_parameters:
+    *error_msg = apr_psprintf(rule->ruleset->mp, "Operator @fuzzyHash " \
+        "requires valid parameters. File and threshold.");
+    return -1;
+}
+
+static int msre_op_fuzzy_hash_execute(modsec_rec *msr, msre_rule *rule,
+    msre_var *var, char **error_msg)
+{
+
+#ifdef WITH_SSDEEP
+    char result[FUZZY_MAX_RESULT];
+    struct fuzzy_hash_param_data *param = rule->op_param_data;
+    struct fuzzy_hash_chunk *chunk = param->head;
+#endif
+
+    if (error_msg == NULL)
+    {
+        return -1;
+    }
+
+    *error_msg = NULL;
+
+#ifdef WITH_SSDEEP
+    if (fuzzy_hash_buf(var->value, var->value_len, result))
+    {
+        *error_msg = apr_psprintf(rule->ruleset->mp, "Problems generating " \
+            "fuzzy hash.");
+
+        return -1;
+    }
+
+    while (chunk != NULL)
+    {
+        int i = fuzzy_compare(chunk->data, result);
+        msr_log(msr, 9, "%d (%s)", i, chunk->data);
+        if (i >= param->threshold)
+        {
+            *error_msg = apr_psprintf(msr->mp, "Fuzzy hash of %s matched " \
+                "with %s (from: %s). Score: %d.", var->name, chunk->data,
+                param->file, i);
+            return 1;
+        }
+        chunk = chunk->next;
+    }
+#else
+    *error_msg = apr_psprintf(rule->ruleset->mp, "ModSecurity was not " \
+        "compiled with ssdeep support.");
+
+    return -1;
+
+#endif
+
+    /* No match. */
+    return 0;
+}
+
 /* inspectFile */
 
 static int msre_op_inspectFile_init(msre_rule *rule, char **error_msg) {
@@ -4502,7 +4710,21 @@ void msre_engine_register_default_operators(msre_engine *engine) {
         msre_op_containsWord_execute
     );
 
-    /* is */
+    /* detectSQLi */
+    msre_engine_op_register(engine,
+        "detectSQLi",
+         NULL,
+         msre_op_detectSQLi_execute
+    );
+
+    /* detectXSS */
+    msre_engine_op_register(engine,
+        "detectXSS",
+         NULL,
+         msre_op_detectXSS_execute
+    );
+
+    /* streq */
     msre_engine_op_register(engine,
         "streq",
         NULL, /* ENH init function to flag var substitution */
@@ -4591,6 +4813,13 @@ void msre_engine_register_default_operators(msre_engine *engine) {
         "inspectFile",
         msre_op_inspectFile_init,
         msre_op_inspectFile_execute
+    );
+
+    /* fuzzy_hash */
+    msre_engine_op_register(engine,
+        "fuzzyHash",
+        msre_op_fuzzy_hash_init,
+        msre_op_fuzzy_hash_execute
     );
 
     /* validateByteRange */
